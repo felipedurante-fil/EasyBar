@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Sandbox habilitado -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+
+	<!-- Conexões de rede de saída (HTTP/HTTPS) — obrigatório para WKWebView -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+
+	<!-- Leitura/gravação em arquivos selecionados pelo usuário (upload e download via NSOpenPanel) -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+
+	<!-- Gravação na pasta Downloads do usuário (destino padrão de downloads do WKDownload) -->
+	<key>com.apple.security.files.downloads.read-write</key>
+	<true/>
+</dict>
+</plist>
