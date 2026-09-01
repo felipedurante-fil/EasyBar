@@ -2,7 +2,7 @@
 
 Alternativa gratuita ao [Slidepad](https://slidepad.app) para macOS. Painel lateral deslizante com abas de navegacao web, timer Pomodoro e bloco de notas.
 
-**Versao atual: 1.5**
+**Versao atual: 1.6**
 
 ## Funcionalidades
 
@@ -17,7 +17,13 @@ Alternativa gratuita ao [Slidepad](https://slidepad.app) para macOS. Painel late
 - Favicon automatico via Google Favicons API
 - Drag & drop para reordenar abas
 - Suspensao de abas para economizar memoria
-- Suporte a downloads com pasta configuravel
+
+### Downloads
+- Janela de Downloads com progresso, "Mostrar no Finder" e "Abrir arquivo"
+- Suporte a downloads via blob / `<a download>` / `window.open()` (Gemini, ChatGPT, Google Docs)
+- Links de download hospedados em CDNs (Slack, Google, S3) nao sao mais bloqueados
+- Pasta padrao `~/Downloads/EasyBar`, configuravel
+- Opcao de perguntar o destino a cada download ou salvar direto
 
 ### Timer Pomodoro
 - Opcoes de 5, 10, 15, 20 e 25 minutos
@@ -60,7 +66,8 @@ EasyBar/
 ├── ContentView.swift          — Painel principal com abas e Pomodoro
 ├── Models.swift               — WebTab, AppSettings, persistencia
 ├── SlideWindowController.swift — Janela deslizante e hotkey global
-├── WebView.swift              — WKWebView wrapper e gerenciador de abas
+├── WebView.swift              — WKWebView wrapper, gerenciador de abas e downloads
+├── Downloads.swift            — Gerenciador e janela de Downloads
 └── SecondaryViews.swift       — Telas de configuracoes, notas, edicao
 ```
 

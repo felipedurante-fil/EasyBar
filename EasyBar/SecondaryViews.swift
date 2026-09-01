@@ -582,7 +582,16 @@ struct SettingsWindow: View {
                     // Downloads
                     GroupBox(label: Text("Downloads").bold()) {
                         VStack(alignment: .leading, spacing: 10) {
-                            Text("Pasta onde os arquivos baixados pelo app serão salvos. Padrão: ~/Downloads.")
+                            Toggle("Perguntar onde salvar cada arquivo", isOn: $settings.askDownloadLocation)
+                            Text(settings.askDownloadLocation
+                                 ? "Cada download abre uma janela para você escolher o local."
+                                 : "Os arquivos vão direto para a pasta abaixo, sem perguntar.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+
+                            Divider()
+
+                            Text("Pasta onde os arquivos baixados pelo app serão salvos. Padrão: ~/Downloads/EasyBar.")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
 
@@ -599,7 +608,7 @@ struct SettingsWindow: View {
                                         .truncationMode(.middle)
                                         .foregroundColor(.primary)
                                 } else {
-                                    Text("~/Downloads (padrão do sistema)")
+                                    Text("~/Downloads/EasyBar (padrão)")
                                         .font(.caption)
                                         .foregroundColor(.secondary)
                                 }
@@ -639,14 +648,14 @@ struct SettingsWindow: View {
                                 }
                             }
 
-                            if let folder = settings.downloadFolder {
-                                Button(action: { NSWorkspace.shared.open(folder) }) {
-                                    Label("Abrir Pasta no Finder", systemImage: "arrow.up.right.square")
-                                        .font(.caption)
-                                }
-                                .buttonStyle(.plain)
-                                .foregroundColor(.accentColor)
+                            Button(action: {
+                                NSWorkspace.shared.open(settings.effectiveDownloadFolder)
+                            }) {
+                                Label("Abrir Pasta no Finder", systemImage: "arrow.up.right.square")
+                                    .font(.caption)
                             }
+                            .buttonStyle(.plain)
+                            .foregroundColor(.accentColor)
                         }
                         .padding(8)
                     }

@@ -6,7 +6,7 @@ import ServiceManagement
 
 // MARK: - Versão do Aplicativo
 /// Fonte única de verdade para a versão. Usada em SettingsSnapshot e no About.
-public let kAppVersion = "1.5"
+public let kAppVersion = "1.6"
 
 // MARK: - Direção do Deslizamento
 
@@ -94,6 +94,7 @@ public final class AppSettings: ObservableObject {
         static let hotKeyCode             = "hotKeyCode"
         static let hotKeyModifiers        = "hotKeyModifiers"
         static let downloadFolderBookmark = "downloadFolderBookmark"
+        static let askDownloadLocation    = "askDownloadLocation"
         // Chaves legadas — lidas uma vez para migração, depois removidas
         static let windowWidth            = "windowWidth"
         static let windowHeight           = "windowHeight"
@@ -124,6 +125,9 @@ public final class AppSettings: ObservableObject {
     @Published public var hotKeyModifiers:       UInt32          = Defaults.hotKeyModifiers
     /// Pasta de destino para downloads. `nil` = usar `~/Downloads` (padrão do sistema).
     @Published public var downloadFolder:        URL?            = nil
+    /// Quando `true`, cada download abre um `NSSavePanel` perguntando onde salvar.
+    /// Quando `false`, o arquivo vai direto para `effectiveDownloadFolder`.
+    @Published public var askDownloadLocation:   Bool            = true
 
     @Published public var launchAtLogin: Bool = false {
         didSet {
@@ -153,9 +157,34 @@ public final class AppSettings: ObservableObject {
 
     // MARK: - Pasta de Downloads
 
+    /// Pasta `~/Downloads` **real** do usuário.
+    ///
+    /// IMPORTANTE: em app sandboxed, `FileManager.homeDirectoryForCurrentUser`
+    /// aponta para `~/Library/Containers/<bundle-id>/Data` — uma pasta oculta.
+    /// `url(for: .downloadsDirectory)` resolve para o `~/Downloads` verdadeiro
+    /// graças à entitlement `com.apple.security.files.downloads.read-write`.
+    public static var systemDownloadsFolder: URL {
+        if let url = try? FileManager.default.url(
+            for: .downloadsDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true) {
+            return url
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Downloads")
+    }
+
+    /// Pasta padrão do EasyBar quando o usuário não escolheu uma: `~/Downloads/EasyBar`.
+    /// Mantém os arquivos baixados pelo app separados do resto de `~/Downloads`.
+    public static var defaultDownloadFolder: URL {
+        let folder = systemDownloadsFolder.appendingPathComponent("EasyBar", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: folder, withIntermediateDirectories: true)
+        return folder
+    }
+
     /// Retorna a pasta efetiva de downloads:
     /// - Pasta personalizada configurada (se existir no disco) → usa ela.
-    /// - Caso contrário → `~/Downloads` (criando se necessário).
+    /// - Caso contrário → `~/Downloads/EasyBar` (criando se necessário).
     public var effectiveDownloadFolder: URL {
         if let custom = downloadFolder {
             var isDir: ObjCBool = false
@@ -164,11 +193,7 @@ public final class AppSettings: ObservableObject {
                 return custom
             }
         }
-        let fallback = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Downloads")
-        try? FileManager.default.createDirectory(
-            at: fallback, withIntermediateDirectories: true)
-        return fallback
+        return AppSettings.defaultDownloadFolder
     }
 
     /// Remove a pasta de downloads personalizada e o bookmark salvo.
@@ -268,6 +293,7 @@ public final class AppSettings: ObservableObject {
         hotKeyCode            = Defaults.hotKeyCode
         hotKeyModifiers       = Defaults.hotKeyModifiers
         downloadFolder        = nil
+        askDownloadLocation   = true
     }
 
     // MARK: - Launch at Login
@@ -312,6 +338,7 @@ public final class AppSettings: ObservableObject {
         ud.set(launchAtLogin,                 forKey: Keys.launchAtLogin)
         ud.set(hotKeyCode,                    forKey: Keys.hotKeyCode)
         ud.set(Int(hotKeyModifiers),          forKey: Keys.hotKeyModifiers)
+        ud.set(askDownloadLocation,           forKey: Keys.askDownloadLocation)
         // downloadFolder é persistido via security-scoped bookmark em chooseDownloadFolder()
     }
 
@@ -372,6 +399,9 @@ public final class AppSettings: ObservableObject {
 
         let savedMods   = ud.integer(forKey: Keys.hotKeyModifiers)
         hotKeyModifiers = savedMods > 0 ? UInt32(savedMods) : Defaults.hotKeyModifiers
+
+        // Perguntar onde salvar cada download (padrão: sim)
+        askDownloadLocation = (ud.object(forKey: Keys.askDownloadLocation) as? Bool) ?? true
 
         // Remove chave legada de monitor (não mais utilizada)
         ud.removeObject(forKey: Keys.alwaysMainMonitor)

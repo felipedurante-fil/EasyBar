@@ -15,14 +15,24 @@ struct EasyBarApp: App {
 // MARK: - AppDelegate
 
 class AppDelegate: NSObject, NSApplicationDelegate {
+
+    /// Acesso ao delegate a partir de tipos que não são views (ex.: WebViewCoordinator).
+    static private(set) weak var shared: AppDelegate?
+
     var settings:         AppSettings!
     var windowController: SlideWindowController?
     var statusItem:       NSStatusItem?
 
-    // Janela de configuracoes gerenciada manualmente para nao duplicar
-    private var settingsWindowController: NSWindowController?
+    // Janelas gerenciadas manualmente para nao duplicar
+    private var settingsWindowController:  NSWindowController?
+    private var downloadsWindowController: NSWindowController?
+
+    /// Janela de Downloads (se aberta) — usada como host de sheet para o NSSavePanel.
+    var downloadsWindow: NSWindow? { downloadsWindowController?.window }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppDelegate.shared = self
+
         // IMPORTANTE: deve ser a primeira chamada para garantir que o app
         // nunca apareca na Dock nem no App Switcher (Cmd+Tab).
         NSApp.setActivationPolicy(.accessory)
@@ -66,6 +76,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         toggleItem.target = self
         menu.addItem(toggleItem)
+
+        menu.addItem(.separator())
+
+        let downloadsItem = NSMenuItem(
+            title: "Downloads…",
+            action: #selector(showDownloadsWindowAction),
+            keyEquivalent: ""
+        )
+        downloadsItem.target = self
+        menu.addItem(downloadsItem)
 
         menu.addItem(.separator())
 
@@ -134,6 +154,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settingsWindowController = wc
         wc.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func showDownloadsWindowAction() {
+        showDownloadsWindow(activate: true)
+    }
+
+    /// Abre (ou traz à frente) a janela de Downloads.
+    /// - Parameter activate: se `true`, rouba o foco; se `false`, só aparece
+    ///   à frente sem interromper o que o usuário está fazendo (usado quando
+    ///   um download começa/termina em segundo plano).
+    func showDownloadsWindow(activate: Bool) {
+        if let existing = downloadsWindowController, let window = existing.window {
+            if activate {
+                window.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+            } else if !window.isVisible {
+                window.orderFrontRegardless()
+            }
+            return
+        }
+
+        let hosting = NSHostingController(rootView: DownloadsWindow())
+        let window  = NSWindow(contentViewController: hosting)
+        window.title                = "Downloads"
+        window.styleMask            = [.titled, .closable, .resizable]
+        window.isReleasedWhenClosed = false
+        window.setContentSize(NSSize(width: 480, height: 400))
+        window.center()
+
+        let wc = NSWindowController(window: window)
+        downloadsWindowController = wc
+
+        if activate {
+            wc.showWindow(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            window.orderFrontRegardless()
+        }
     }
 
     @objc func restartAction() {

@@ -157,6 +157,29 @@ class SlideWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    // MARK: - Supressão temporária do nível flutuante
+    //
+    // O painel é `.floating` + `.nonactivatingPanel`. Qualquer NSSavePanel /
+    // NSOpenPanel apresentado (mesmo como sheet) fica coberto por ele e os
+    // cliques do mouse continuam indo para o painel → a janela de salvar
+    // parece "travada" (só o campo de texto em foco responde ao teclado).
+    // Enquanto um painel do sistema está na tela, baixamos o nível para
+    // `.normal` e restauramos depois.
+
+    private var suppressedLevel: NSWindow.Level?
+
+    func suppressFloatingLevel() {
+        guard suppressedLevel == nil, let w = window else { return }
+        suppressedLevel = w.level
+        w.level = .normal
+    }
+
+    func restoreFloatingLevel() {
+        guard let lvl = suppressedLevel, let w = window else { return }
+        w.level = lvl
+        suppressedLevel = nil
+    }
+
     // MARK: - Toggle Visibilidade
 
     @objc func toggleWindow() {

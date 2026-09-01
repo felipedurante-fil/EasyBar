@@ -12,6 +12,9 @@ struct ContentView: View {
     /// TabManager criado uma única vez, vive enquanto a ContentView existir.
     @StateObject private var tabManager = TabManager()
 
+    /// Histórico de downloads da sessão (para o badge no botão da barra).
+    @ObservedObject private var downloads = DownloadsManager.shared
+
     // MARK: Estados de modais
     @State private var showingAddTab            = false
     @State private var showingSettings          = false
@@ -128,6 +131,23 @@ struct ContentView: View {
                     }
                     .buttonStyle(PlainButtonStyle())
                     .help("Bloco de Notas Rápido")
+
+                    Button(action: {
+                        AppDelegate.shared?.showDownloadsWindow(activate: true)
+                    }) {
+                        Image(systemName: "tray.and.arrow.down")
+                            .frame(width: 28, height: 28)
+                            .overlay(alignment: .topTrailing) {
+                                if downloads.activeCount > 0 {
+                                    Circle()
+                                        .fill(Color.accentColor)
+                                        .frame(width: 7, height: 7)
+                                        .offset(x: -4, y: 4)
+                                }
+                            }
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                    .help("Downloads")
 
                     PomodoroButton(
                         isActive: pomodoroActive,

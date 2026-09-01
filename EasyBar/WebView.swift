@@ -367,6 +367,18 @@ public final class WebViewCoordinator: NSObject,
     let tab: WebTab
     weak var tabManager: TabManager?
 
+    /// URLs de navegações link-activated para outro domínio, aguardando a
+    /// resposta HTTP para decidir entre "abrir link externo" e "baixar arquivo".
+    /// Sem isso, links de download hospedados em CDNs (files.slack.com,
+    /// *.googleusercontent.com, S3, etc.) eram cancelados e viravam o diálogo
+    /// "Abrir Link Externo" em vez de baixar.
+    private var pendingCrossDomainNavigations: Set<URL> = []
+
+    /// WebViews de popup criados para conter downloads iniciados via window.open()
+    /// ou target="_blank". Retidos até o download começar ou o popup fechar,
+    /// senão o ARC os desalocaria antes do WKDownload nascer.
+    private var transientPopups: [WKWebView] = []
+
     init(tab: WebTab, tabManager: TabManager) {
         self.tab        = tab
         self.tabManager = tabManager
@@ -415,6 +427,11 @@ public final class WebViewCoordinator: NSObject,
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.tabManager?.loadingStates[tabId] = false
+        }
+        // Navegação abortou antes da resposta: descarta o pedido pendente
+        // de decisão cross-domain para não acumular URLs órfãs.
+        if let failedURL = (error as NSError).userInfo[NSURLErrorFailingURLErrorKey] as? URL {
+            pendingCrossDomainNavigations.remove(failedURL)
         }
         // Fallback HTTP para endereços locais com HTTPS com falha
         guard let url = webView.url ?? webView.backForwardList.currentItem?.url,
@@ -498,29 +515,43 @@ public final class WebViewCoordinator: NSObject,
     public func webView(
         _ webView: WKWebView,
         decidePolicyFor navigationAction: WKNavigationAction,
-        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        preferences: WKWebpagePreferences,
+        decisionHandler: @escaping (WKNavigationActionPolicy, WKWebpagePreferences) -> Void
     ) {
+        // 1. Download explícito: <a download>, blob:/data: com download,
+        //    "Salvar link como" do menu de contexto. O WebKit liga
+        //    shouldPerformDownload — é assim que a maioria dos apps (Gemini,
+        //    ChatGPT, Google Docs) exporta arquivos. Precisa vir ANTES do
+        //    guard de navigationType, pois o clique sintético via JS tem
+        //    navigationType .other, não .linkActivated.
+        if navigationAction.shouldPerformDownload {
+            decisionHandler(.download, preferences)
+            return
+        }
+
         guard let url = navigationAction.request.url else {
-            decisionHandler(.allow)
+            decisionHandler(.allow, preferences)
             return
         }
         guard navigationAction.navigationType == .linkActivated else {
-            decisionHandler(.allow)
+            decisionHandler(.allow, preferences)
             return
         }
         if isAuthDomain(url) {
-            decisionHandler(.allow)
+            decisionHandler(.allow, preferences)
             return
         }
         if isDifferentDomain(url, from: tab.url) {
-            decisionHandler(.cancel)
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                self.showLinkDialog(url: url, webView: webView)
+            // Pode ser uma página externa OU um download hospedado em CDN.
+            // Deixa a navegação começar e decide em decidePolicyFor:navigationResponse,
+            // quando Content-Disposition / MIME já são conhecidos.
+            if navigationAction.targetFrame?.isMainFrame ?? true {
+                pendingCrossDomainNavigations.insert(url)
             }
-        } else {
-            decisionHandler(.allow)
+            decisionHandler(.allow, preferences)
+            return
         }
+        decisionHandler(.allow, preferences)
     }
 
     // MARK: WKNavigationDelegate — Política de Resposta (Download)
@@ -531,23 +562,33 @@ public final class WebViewCoordinator: NSObject,
     public func webView(_ webView: WKWebView,
                         decidePolicyFor navigationResponse: WKNavigationResponse,
                         decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
-        // Verifica Content-Disposition: attachment
+        let responseURL = navigationResponse.response.url
+
+        // Content-Disposition: attachment  →  download
+        var isAttachment = false
         if let http = navigationResponse.response as? HTTPURLResponse {
-            let disposition = http.value(forHTTPHeaderField: "Content-Disposition") ?? ""
-            if disposition.lowercased().hasPrefix("attachment") {
-                if #available(macOS 11.3, *) {
-                    decisionHandler(.download)
-                    return
-                }
-            }
+            let disposition = (http.value(forHTTPHeaderField: "Content-Disposition") ?? "").lowercased()
+            isAttachment = disposition.contains("attachment")
         }
-        // MIME type que o WKWebView não consegue renderizar (ex: .zip, .docx, binários)
-        if !navigationResponse.canShowMIMEType {
-            if #available(macOS 11.3, *) {
-                decisionHandler(.download)
-                return
-            }
+
+        if isAttachment || !navigationResponse.canShowMIMEType {
+            if let responseURL { pendingCrossDomainNavigations.remove(responseURL) }
+            decisionHandler(.download)
+            return
         }
+
+        // Página renderizável em outro domínio, aberta por clique do usuário:
+        // aí sim perguntamos se abre no navegador padrão ou nesta aba.
+        if let responseURL,
+           navigationResponse.isForMainFrame,
+           pendingCrossDomainNavigations.remove(responseURL) != nil {
+            decisionHandler(.cancel)
+            DispatchQueue.main.async { [weak self] in
+                self?.showLinkDialog(url: responseURL, webView: webView)
+            }
+            return
+        }
+
         decisionHandler(.allow)
     }
 
@@ -558,6 +599,7 @@ public final class WebViewCoordinator: NSObject,
                         navigationResponse: WKNavigationResponse,
                         didBecome download: WKDownload) {
         download.delegate = self
+        releaseTransientPopup(webView)
     }
 
     @available(macOS 11.3, *)
@@ -565,6 +607,7 @@ public final class WebViewCoordinator: NSObject,
                         navigationAction: WKNavigationAction,
                         didBecome download: WKDownload) {
         download.delegate = self
+        releaseTransientPopup(webView)
     }
 
     // MARK: WKDownloadDelegate
@@ -576,38 +619,97 @@ public final class WebViewCoordinator: NSObject,
         suggestedFilename: String,
         completionHandler: @escaping (URL?) -> Void
     ) {
-        // Pasta padrão: pasta configurada pelo usuário ou ~/Downloads
-        let defaultFolder = tabManager?.settings?.effectiveDownloadFolder
-                         ?? FileManager.default.homeDirectoryForCurrentUser
-                                .appendingPathComponent("Downloads")
+        let manager = DownloadsManager.shared
+        let folder  = tabManager?.settings?.effectiveDownloadFolder
+                   ?? AppSettings.defaultDownloadFolder
+        let ask     = tabManager?.settings?.askDownloadLocation ?? true
 
         DispatchQueue.main.async {
+            manager.register(download, suggestedFilename: suggestedFilename)
+            AppDelegate.shared?.showDownloadsWindow(activate: false)
+
+            // Entrega o arquivo diretamente na pasta configurada.
+            let deliver: (URL?) -> Void = { url in
+                if let url {
+                    // WKDownload falha se o arquivo já existir no destino.
+                    try? FileManager.default.removeItem(at: url)
+                    manager.setDestination(url, for: download)
+                }
+                completionHandler(url)
+            }
+
+            guard ask else {
+                deliver(DownloadsManager.uniqueDestination(in: folder, filename: suggestedFilename))
+                return
+            }
+
             let panel = NSSavePanel()
             panel.nameFieldStringValue = suggestedFilename
-            panel.directoryURL        = defaultFolder
-            // Fica na frente do NSPanel flutuante do EasyBar
-            panel.level = NSWindow.Level(rawValue: NSWindow.Level.popUpMenu.rawValue + 1)
-            NSApp.activate(ignoringOtherApps: true)
-            panel.orderFrontRegardless()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                panel.makeKeyAndOrderFront(nil)
+            panel.directoryURL         = folder
+            panel.canCreateDirectories = true
+
+            Self.present(panel,
+                         host: download.webView?.window,
+                         openDownloadsAsHost: true) { result in
+                deliver(result == .OK ? panel.url : nil)
             }
-            panel.begin { result in
-                completionHandler(result == .OK ? panel.url : nil)
-            }
+        }
+    }
+
+    // MARK: Apresentação de NSSavePanel / NSOpenPanel
+    //
+    // O painel do EasyBar é `.floating` + `.nonactivatingPanel`: um
+    // NSSavePanel/NSOpenPanel apresentado sobre ele — como janela livre
+    // (`begin`) ou até como sheet — fica coberto e os cliques do mouse
+    // continuam indo para o painel. Só o campo de texto em foco responde
+    // (ao teclado) → a janela parece "travada".
+    //
+    // Solução em duas partes:
+    //   1. baixar o nível do painel do EasyBar para `.normal` enquanto o
+    //      painel do sistema estiver na tela (restaurado no fim);
+    //   2. apresentar como SHEET preso a uma janela real — a de Downloads,
+    //      que é uma NSWindow comum e previsível. `begin` livre só como
+    //      último recurso.
+
+    static func present(_ panel: NSSavePanel,
+                        host preferredHost: NSWindow?,
+                        openDownloadsAsHost: Bool,
+                        completion: @escaping (NSApplication.ModalResponse) -> Void) {
+        let slide = AppDelegate.shared?.windowController
+        NSApp.activate(ignoringOtherApps: true)
+        slide?.suppressFloatingLevel()
+
+        let finish: (NSApplication.ModalResponse) -> Void = { response in
+            slide?.restoreFloatingLevel()
+            completion(response)
+        }
+
+        if openDownloadsAsHost {
+            AppDelegate.shared?.showDownloadsWindow(activate: true)
+        }
+
+        // Ordem de preferência de host da sheet:
+        //  1. janela de Downloads (NSWindow comum, previsível) — para downloads;
+        //  2. host indicado (o painel do EasyBar) se estiver de fato na tela;
+        //  3. begin() livre — último recurso.
+        if openDownloadsAsHost, let host = AppDelegate.shared?.downloadsWindow {
+            panel.beginSheetModal(for: host, completionHandler: finish)
+        } else if slide?.isVisible == true,
+                  let host = preferredHost ?? slide?.window,
+                  host.isVisible {
+            panel.beginSheetModal(for: host, completionHandler: finish)
+        } else if let host = AppDelegate.shared?.downloadsWindow {
+            panel.beginSheetModal(for: host, completionHandler: finish)
+        } else {
+            panel.begin(completionHandler: finish)
         }
     }
 
     @available(macOS 11.3, *)
     public func downloadDidFinish(_ download: WKDownload) {
         DispatchQueue.main.async {
-            let alert = NSAlert()
-            alert.messageText     = "Download Concluído"
-            alert.informativeText = "O arquivo foi salvo com sucesso."
-            alert.alertStyle      = .informational
-            alert.addButton(withTitle: "OK")
-            NSApp.activate(ignoringOtherApps: true)
-            alert.runModal()
+            DownloadsManager.shared.markFinished(download)
+            AppDelegate.shared?.showDownloadsWindow(activate: false)
         }
     }
 
@@ -616,32 +718,14 @@ public final class WebViewCoordinator: NSObject,
                          didFailWithError error: Error,
                          resumeData: Data?) {
         DispatchQueue.main.async {
-            let alert = NSAlert()
-            alert.messageText     = "Erro no Download"
-            alert.informativeText = error.localizedDescription
-            alert.alertStyle      = .warning
-            NSApp.activate(ignoringOtherApps: true)
-            alert.runModal()
-        }
-    }
-
-    private func showDownloadNotification(folder: URL) {
-        let alert = NSAlert()
-        alert.messageText     = "Download Concluído"
-        alert.informativeText = "Arquivo salvo em:\n\(folder.path)"
-        alert.alertStyle      = .informational
-        alert.addButton(withTitle: "Abrir Pasta")
-        alert.addButton(withTitle: "OK")
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(folder)
+            DownloadsManager.shared.markFailed(download, error: error)
         }
     }
 
     // MARK: WKUIDelegate — Upload de Arquivos
-    // CORRIGIDO: o NSOpenPanel ficava atrás do NSPanel flutuante.
-    // Solução: nível popUpMenu + 1 (acima de qualquer floating panel) e makeKeyAndOrderFront
-    // com delay de 50ms para que o painel principal libere o foco antes.
+    // O NSOpenPanel sofre do mesmo problema do NSSavePanel de download: coberto
+    // pelo painel flutuante `.nonactivatingPanel`, os cliques não chegam nele.
+    // Reusa Self.present (baixa o nível do painel + apresenta como sheet).
 
     public func webView(
         _ webView: WKWebView,
@@ -649,7 +733,7 @@ public final class WebViewCoordinator: NSObject,
         initiatedByFrame frame: WKFrameInfo,
         completionHandler: @escaping ([URL]?) -> Void
     ) {
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak webView] in
             let panel = NSOpenPanel()
             panel.canChooseFiles          = true
             panel.canChooseDirectories    = false
@@ -657,14 +741,10 @@ public final class WebViewCoordinator: NSObject,
             panel.message                 = "Selecione o arquivo para enviar"
             panel.prompt                  = "Selecionar"
             panel.allowedContentTypes     = []
-            // Nível acima de popUpMenu (101) garante ficar na frente do NSPanel floating (3)
-            panel.level = NSWindow.Level(rawValue: NSWindow.Level.popUpMenu.rawValue + 1)
-            NSApp.activate(ignoringOtherApps: true)
-            panel.orderFrontRegardless()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                panel.makeKeyAndOrderFront(nil)
-            }
-            panel.begin { response in
+
+            Self.present(panel,
+                         host: webView?.window,
+                         openDownloadsAsHost: false) { response in
                 completionHandler(response == .OK ? panel.urls : nil)
             }
         }
@@ -683,7 +763,30 @@ public final class WebViewCoordinator: NSObject,
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        guard let url = navigationAction.request.url else { return nil }
+        let url = navigationAction.request.url
+
+        // Popup que é (ou vai virar) um download: window.open() seguido de
+        // <a download> / blob:, ou target="_blank" apontando para um arquivo.
+        // Mantém dentro do app num WebView efêmero — senão o download ia para
+        // o Safari (NSWorkspace.open) ou se perdia (about:blank).
+        let looksLikeDownload =
+            navigationAction.shouldPerformDownload ||
+            url == nil ||
+            url?.host == nil ||
+            url?.scheme == "blob" ||
+            url?.scheme == "data"
+
+        let isAuth = url.map { self.isAuthDomain($0) } ?? false
+        if looksLikeDownload && !isAuth {
+            let popup = WKWebView(frame: .zero, configuration: configuration)
+            popup.customUserAgent   = kSafariUA
+            popup.navigationDelegate = self
+            popup.uiDelegate         = self
+            retainTransientPopup(popup)
+            return popup
+        }
+
+        guard let url else { return nil }
 
         if isAuthDomain(url) {
             let popupWebView = WKWebView(frame: .zero, configuration: configuration)
@@ -716,7 +819,28 @@ public final class WebViewCoordinator: NSObject,
     }
 
     /// Evita EXC_BAD_ACCESS quando o site chama `window.close()` em popup que não existe.
-    public func webViewDidClose(_ webView: WKWebView) {}
+    public func webViewDidClose(_ webView: WKWebView) {
+        releaseTransientPopup(webView)
+    }
+
+    // MARK: Popups efêmeros (contêineres de download)
+
+    private func retainTransientPopup(_ webView: WKWebView) {
+        transientPopups.append(webView)
+        // Rede de segurança: se nenhum download nascer (ex.: popup de anúncio),
+        // libera após 20s para não vazar o WebContent process.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self, weak webView] in
+            guard let webView else { return }
+            self?.releaseTransientPopup(webView)
+        }
+    }
+
+    private func releaseTransientPopup(_ webView: WKWebView) {
+        guard let idx = transientPopups.firstIndex(where: { $0 === webView }) else { return }
+        transientPopups[idx].navigationDelegate = nil
+        transientPopups[idx].uiDelegate         = nil
+        transientPopups.remove(at: idx)
+    }
 
     // MARK: Certificados SSL
 
