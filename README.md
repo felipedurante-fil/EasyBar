@@ -41,10 +41,24 @@ Alternativa gratuita ao [Slidepad](https://slidepad.app) para macOS. Painel late
 - Reset para padroes de fabrica
 - Iniciar com o sistema
 
+## Baixar e usar (sem compilar)
+
+1. Baixe o `EasyBar-<versao>-macOS.zip` na pagina de [Releases](https://github.com/felipedurante-fil/EasyBar/releases/latest).
+2. Descompacte e mova **EasyBar.app** para a pasta **Aplicativos**.
+3. **Primeira vez:** clique com o botao direito no app → **Abrir** → **Abrir**.
+   (O app nao e notarizado pela Apple — nao ha conta de desenvolvedor paga —
+   entao o macOS pede essa confirmacao so no primeiro uso.)
+
+   Se aparecer "o app esta danificado", rode no Terminal:
+   ```
+   xattr -dr com.apple.quarantine /Applications/EasyBar.app
+   ```
+
+O app abre na barra de menus (icone de sidebar). Nao aparece na Dock.
+
 ## Requisitos
 
-- macOS 13 (Ventura) ou superior
-- Xcode 15 ou superior
+- macOS 26.4 ou superior (Apple Silicon)
 
 ## Como compilar
 
