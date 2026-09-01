@@ -81,7 +81,7 @@ EasyBar/
 
 ## Creditos
 
-Pensado e editado por Felipe Durante. Codigo base gerado por Manus AI.
+Feito via vibe coding (Manus e Claude) e revisado por [Felipe Durante](https://github.com/felipedurante-fil).
 
 ## Licenca
 

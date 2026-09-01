@@ -349,8 +349,7 @@ Adicione abas que acessam sites de forma rápida, sem precisar abrir o navegador
 Fiz o aplicativo de acordo com minhas necessidades. Adicionei algumas outras funções. \
 Espero que seja útil para você =)
 
-Pensado e editado por Felipe Durante. \
-O código base foi gerado pelo Manus.
+Feito via vibe coding (Manus e Claude) e revisado por Felipe Durante.
 """)
                     .font(.body)
                     .foregroundColor(.secondary)

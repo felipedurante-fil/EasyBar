@@ -220,8 +220,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = "EasyBar"
         alert.informativeText = """
-        Pensado e editado por Felipe Durante.
-        Código base gerado por Manus AI.
+        Feito via vibe coding (Manus e Claude) e revisado por Felipe Durante.
 
         Versão \(kAppVersion)
 
