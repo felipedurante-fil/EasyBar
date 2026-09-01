@@ -305,16 +305,23 @@ struct ContentView: View {
             settings.tabs[index].title = pageTitle
         }
 
-        // Favicon via API do Google — apenas se ainda não tem ícone e não foi tentado antes
+        // Favicon via API do Google — só se ainda não tem ícone e não foi tentado antes.
+        // NÃO busca para hosts de rede local / IP literal: não faz sentido, evita
+        // vazar nomes internos para o Google e evita um crash com host IPv6
+        // (`[::1]` não forma URL válida) — antes havia um force-unwrap aqui.
         if settings.tabs[index].faviconData == nil,
            !tabManager.faviconAttempted.contains(tabId),
-           let host = webView.url?.host {
+           let host = webView.url?.host,
+           !isLocalNetworkAddress(host),
+           let encodedHost = host.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed),
+           let googleURL = URL(string: "https://www.google.com/s2/favicons?domain=\(encodedHost)&sz=64") {
             tabManager.faviconAttempted.insert(tabId)
-            let googleURL = URL(string: "https://www.google.com/s2/favicons?domain=\(host)&sz=64")!
             // ContentView é uma struct — capturamos settings (referência) diretamente
             let settingsRef = settings
-            URLSession.shared.dataTask(with: googleURL) { data, _, _ in
-                guard let data = data, data.count > 500 else { return }
+            URLSession.shared.dataTask(with: googleURL) { data, response, _ in
+                guard let data = data, data.count > 500,
+                      (response as? HTTPURLResponse)?.statusCode == 200,
+                      NSImage(data: data) != nil else { return }
                 DispatchQueue.main.async {
                     if let i = settingsRef.tabs.firstIndex(where: { $0.id == tabId }) {
                         settingsRef.tabs[i].faviconData = data

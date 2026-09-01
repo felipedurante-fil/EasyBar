@@ -6,7 +6,7 @@ import ServiceManagement
 
 // MARK: - Versão do Aplicativo
 /// Fonte única de verdade para a versão. Usada em SettingsSnapshot e no About.
-public let kAppVersion = "1.6"
+public let kAppVersion = "1.6.1"
 
 // MARK: - Direção do Deslizamento
 
@@ -477,7 +477,15 @@ public final class AppSettings: ObservableObject {
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
 
-        tabs                  = snapshot.tabs
+        // SEGURANÇA: descarta abas do backup cuja URL não seja http/https com
+        // host (ex.: `file://`, `javascript:`) — um backup adulterado não deve
+        // conseguir injetar abas que carreguem esquemas perigosos.
+        tabs = snapshot.tabs.compactMap { tab in
+            guard let clean = normalizedWebTabURL(from: tab.url.absoluteString) else { return nil }
+            var t = tab
+            t.url = clean
+            return t
+        }
         widthPercent          = CGFloat(snapshot.widthPercent).clamped(to: 0.01...1.0)
         heightPercent         = CGFloat(snapshot.heightPercent).clamped(to: 0.01...1.0)
         verticalOffsetPercent = CGFloat(snapshot.verticalOffsetPercent).clamped(to: 0.0...0.5)

@@ -141,12 +141,53 @@ public final class DownloadsManager: ObservableObject {
         progressObservers[item.id] = obs
     }
 
+    // MARK: Utilitário — nome de arquivo seguro
+    //
+    // SEGURANÇA: `suggestedFilename` vem do servidor (Content-Disposition).
+    // Sem sanitizar, um nome como `../../../.zshrc` faz `appendingPathComponent`
+    // escapar da pasta de downloads — e a escrita do WKDownload (ou o
+    // `removeItem` que a precede) atinge um arquivo arbitrário dentro do que o
+    // sandbox permite.
+
+    static func sanitizedFilename(_ raw: String) -> String {
+        // 1. só o último componente — elimina `../`, `/abs/path`, etc.
+        var name = (raw as NSString).lastPathComponent
+
+        // 2. remove separadores de caminho, ':' (HFS), NUL e caracteres de controle
+        let forbidden = CharacterSet(charactersIn: "/\\:\u{0}").union(.controlCharacters)
+        name = name.components(separatedBy: forbidden).joined()
+        name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 3. nomes degenerados → genérico
+        if name.isEmpty || name.allSatisfy({ $0 == "." }) {
+            name = "download"
+        }
+        // 4. sem arquivo oculto por acidente
+        while name.hasPrefix(".") { name.removeFirst() }
+        if name.isEmpty { name = "download" }
+
+        // 5. teto de tamanho (limite do APFS é 255 bytes por componente)
+        if name.utf8.count > 200 {
+            let ns   = name as NSString
+            let ext  = ns.pathExtension
+            let base = ns.deletingPathExtension
+            name = String(base.prefix(150)) + (ext.isEmpty ? "" : "." + ext)
+        }
+        return name
+    }
+
     // MARK: Utilitário — destino sem sobrescrever
 
     static func uniqueDestination(in folder: URL, filename: String) -> URL {
         let fm   = FileManager.default
-        let safe = filename.isEmpty ? "download" : filename
+        let safe = sanitizedFilename(filename)
+
         var candidate = folder.appendingPathComponent(safe)
+        // Defesa em profundidade: se ainda assim o caminho escapou da pasta,
+        // força de volta para dentro dela.
+        if !candidate.standardizedFileURL.path.hasPrefix(folder.standardizedFileURL.path) {
+            candidate = folder.appendingPathComponent("download")
+        }
         guard fm.fileExists(atPath: candidate.path) else { return candidate }
 
         let ext  = candidate.pathExtension

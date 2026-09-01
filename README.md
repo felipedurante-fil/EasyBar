@@ -2,7 +2,7 @@
 
 Alternativa gratuita ao [Slidepad](https://slidepad.app) para macOS. Painel lateral deslizante com abas de navegacao web, timer Pomodoro e bloco de notas.
 
-**Versao atual: 1.6**
+**Versao atual: 1.6.1**
 
 ## Funcionalidades
 
@@ -16,6 +16,7 @@ Alternativa gratuita ao [Slidepad](https://slidepad.app) para macOS. Painel late
 - Abas com WKWebView integrado (navegacao web completa)
 - Favicon automatico via Google Favicons API
 - Drag & drop para reordenar abas
+- Arrastar arquivos do Finder direto para a conversa (WhatsApp, Telegram, Gmail...)
 - Suspensao de abas para economizar memoria
 
 ### Downloads

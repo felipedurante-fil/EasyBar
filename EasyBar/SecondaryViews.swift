@@ -254,16 +254,10 @@ struct AddTabWindow: View {
     // MARK: - Helpers
 
     func addTab(url raw: String) {
-        var raw = raw.trimmingCharacters(in: .whitespaces)
-        guard !raw.isEmpty else { return }
-
-        if !raw.contains("://") {
-            // Usa a função centralizada isLocalNetworkAddress de WebView.swift
-            let host = raw.split(separator: "/").first.map(String.init) ?? raw
-            raw = (isLocalNetworkAddress(host) ? "http://" : "https://") + raw
+        guard let url = normalizedWebTabURL(from: raw) else {
+            NSSound.beep()
+            return
         }
-
-        guard let url = URL(string: raw) else { return }
 
         let newTab = WebTab(title: "Carregando...", url: url)
         settings.tabs.append(newTab)
@@ -513,13 +507,10 @@ struct EditTabWindow: View {
     func saveChanges() {
         guard let index = settings.tabs.firstIndex(where: { $0.id == tab.id }) else { return }
 
-        var raw = urlString.trimmingCharacters(in: .whitespaces)
-        if !raw.contains("://") {
-            let host = raw.split(separator: "/").first.map(String.init) ?? raw
-            raw = (isLocalNetworkAddress(host) ? "http://" : "https://") + raw
+        guard let url = normalizedWebTabURL(from: urlString) else {
+            NSSound.beep()
+            return
         }
-
-        guard let url = URL(string: raw) else { return }
 
         settings.tabs[index].title       = title
         settings.tabs[index].url         = url
