@@ -6,7 +6,7 @@ import ServiceManagement
 
 // MARK: - Versão do Aplicativo
 /// Fonte única de verdade para a versão. Usada em SettingsSnapshot e no About.
-public let kAppVersion = "1.6.1"
+public let kAppVersion = "1.7.0"
 
 // MARK: - Direção do Deslizamento
 
@@ -36,18 +36,26 @@ public struct WebTab: Identifiable, Codable, Equatable {
     public var faviconData: Data?
     public var isSuspended: Bool   = false
 
+    /// Descarregamento automático por inatividade, só para esta aba:
+    /// `nil` = usa o padrão global · `0` = nunca descarregar · `N` = após N minutos.
+    /// Opcional de propósito: abas salvas por versões antigas não têm essa chave
+    /// e continuam decodificando normalmente.
+    public var autoSuspendMinutes: Int?
+
     public init(
         id:          UUID   = UUID(),
         title:       String,
         url:         URL,
         faviconData: Data?  = nil,
-        isSuspended: Bool   = false
+        isSuspended: Bool   = false,
+        autoSuspendMinutes: Int? = nil
     ) {
         self.id          = id
         self.title       = title
         self.url         = url
         self.faviconData = faviconData
         self.isSuspended = isSuspended
+        self.autoSuspendMinutes = autoSuspendMinutes
     }
 
     /// Retorna o ícone do site como `NSImage`. Se não houver favicon, retorna o ícone de globo.
@@ -76,6 +84,24 @@ public struct SettingsSnapshot: Codable {
     public var hotKeyModifiers:       UInt32
     public var launchAtLogin:         Bool
     public var appVersion:            String = kAppVersion
+    // Opcionais: backups antigos não têm estas chaves e continuam importando.
+    public var autoSuspendEnabled:    Bool?
+    public var autoSuspendMinutes:    Int?
+}
+
+// MARK: - Opções de descarregamento automático
+// Compartilhado entre Configurações, menu de contexto da aba e o varredor.
+
+public enum AutoSuspend {
+    /// Opções oferecidas (em minutos). 1 min existe para quem tem pouca RAM.
+    public static let choices: [Int] = [1, 5, 10, 15, 30, 60, 120, 240, 480]
+    public static let defaultMinutes = 30
+
+    public static func label(_ minutes: Int) -> String {
+        if minutes < 60 { return "\(minutes) min" }
+        let h = minutes / 60
+        return minutes % 60 == 0 ? "\(h) h" : "\(minutes) min"
+    }
 }
 
 // MARK: - Configurações do Aplicativo
@@ -95,6 +121,8 @@ public final class AppSettings: ObservableObject {
         static let hotKeyModifiers        = "hotKeyModifiers"
         static let downloadFolderBookmark = "downloadFolderBookmark"
         static let askDownloadLocation    = "askDownloadLocation"
+        static let autoSuspendEnabled     = "autoSuspendEnabled"
+        static let autoSuspendMinutes     = "autoSuspendMinutes"
         // Chaves legadas — lidas uma vez para migração, depois removidas
         static let windowWidth            = "windowWidth"
         static let windowHeight           = "windowHeight"
@@ -128,6 +156,15 @@ public final class AppSettings: ObservableObject {
     /// Quando `true`, cada download abre um `NSSavePanel` perguntando onde salvar.
     /// Quando `false`, o arquivo vai direto para `effectiveDownloadFolder`.
     @Published public var askDownloadLocation:   Bool            = true
+    /// Descarrega abas inativas para liberar memória (ver `AutoSuspend`).
+    @Published public var autoSuspendEnabled:    Bool            = true
+    /// Minutos de inatividade antes de descarregar uma aba (padrão global).
+    @Published public var autoSuspendMinutes:    Int             = AutoSuspend.defaultMinutes
+
+    /// Abas descarregadas AUTOMATICAMENTE (só em memória). Quem as descarregou
+    /// foi o varredor, não o usuário — então não persistimos o estado "suspensa":
+    /// ao reabrir o app elas voltam normais (as abas já carregam sob demanda).
+    public var autoSuspendedTabIDs: Set<UUID> = []
 
     @Published public var launchAtLogin: Bool = false {
         didSet {
@@ -153,6 +190,15 @@ public final class AppSettings: ObservableObject {
             .debounce(for: .milliseconds(500), scheduler: RunLoop.main)
             .sink { [weak self] in self?.saveSettings() }
             .store(in: &cancellables)
+    }
+
+    // MARK: - Descarregamento automático
+
+    /// Minutos de inatividade para descarregar `tab`, ou `nil` se ela nunca
+    /// deve ser descarregada. O ajuste da própria aba vence o global.
+    public func effectiveAutoSuspendMinutes(for tab: WebTab) -> Int? {
+        if let own = tab.autoSuspendMinutes { return own > 0 ? own : nil }
+        return autoSuspendEnabled ? max(1, autoSuspendMinutes) : nil
     }
 
     // MARK: - Pasta de Downloads
@@ -294,6 +340,9 @@ public final class AppSettings: ObservableObject {
         hotKeyModifiers       = Defaults.hotKeyModifiers
         downloadFolder        = nil
         askDownloadLocation   = true
+        autoSuspendEnabled    = true
+        autoSuspendMinutes    = AutoSuspend.defaultMinutes
+        autoSuspendedTabIDs   = []
     }
 
     // MARK: - Launch at Login
@@ -327,7 +376,17 @@ public final class AppSettings: ObservableObject {
 
     public func saveSettings() {
         let ud = UserDefaults.standard
-        if let encoded = try? JSONEncoder().encode(tabs) {
+        // Esquece quem já foi reativado e persiste as auto-descarregadas como
+        // "não suspensas" (ver autoSuspendedTabIDs).
+        autoSuspendedTabIDs = autoSuspendedTabIDs.filter { id in
+            tabs.contains { $0.id == id && $0.isSuspended }
+        }
+        let tabsToSave = tabs.map { tab -> WebTab in
+            var t = tab
+            if autoSuspendedTabIDs.contains(tab.id) { t.isSuspended = false }
+            return t
+        }
+        if let encoded = try? JSONEncoder().encode(tabsToSave) {
             ud.set(encoded, forKey: Keys.tabs)
         }
         ud.set(selectedTabId?.uuidString,     forKey: Keys.selectedTabId)
@@ -339,6 +398,8 @@ public final class AppSettings: ObservableObject {
         ud.set(hotKeyCode,                    forKey: Keys.hotKeyCode)
         ud.set(Int(hotKeyModifiers),          forKey: Keys.hotKeyModifiers)
         ud.set(askDownloadLocation,           forKey: Keys.askDownloadLocation)
+        ud.set(autoSuspendEnabled,            forKey: Keys.autoSuspendEnabled)
+        ud.set(autoSuspendMinutes,            forKey: Keys.autoSuspendMinutes)
         // downloadFolder é persistido via security-scoped bookmark em chooseDownloadFolder()
     }
 
@@ -403,6 +464,11 @@ public final class AppSettings: ObservableObject {
         // Perguntar onde salvar cada download (padrão: sim)
         askDownloadLocation = (ud.object(forKey: Keys.askDownloadLocation) as? Bool) ?? true
 
+        // Descarregamento automático de abas inativas (padrão: ligado, 30 min)
+        autoSuspendEnabled = (ud.object(forKey: Keys.autoSuspendEnabled) as? Bool) ?? true
+        let savedMinutes   = ud.integer(forKey: Keys.autoSuspendMinutes)
+        autoSuspendMinutes = savedMinutes > 0 ? savedMinutes : AutoSuspend.defaultMinutes
+
         // Remove chave legada de monitor (não mais utilizada)
         ud.removeObject(forKey: Keys.alwaysMainMonitor)
 
@@ -454,7 +520,9 @@ public final class AppSettings: ObservableObject {
             direction:             direction,
             hotKeyCode:            hotKeyCode,
             hotKeyModifiers:       hotKeyModifiers,
-            launchAtLogin:         launchAtLogin
+            launchAtLogin:         launchAtLogin,
+            autoSuspendEnabled:    autoSuspendEnabled,
+            autoSuspendMinutes:    autoSuspendMinutes
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -492,6 +560,8 @@ public final class AppSettings: ObservableObject {
         direction             = snapshot.direction
         hotKeyCode            = snapshot.hotKeyCode
         hotKeyModifiers       = snapshot.hotKeyModifiers
+        if let e = snapshot.autoSuspendEnabled { autoSuspendEnabled = e }
+        if let m = snapshot.autoSuspendMinutes, m > 0 { autoSuspendMinutes = m }
         // launchAtLogin não é importado automaticamente — requer ação do usuário
         if selectedTabId == nil || !tabs.contains(where: { $0.id == selectedTabId }) {
             selectedTabId = tabs.first?.id

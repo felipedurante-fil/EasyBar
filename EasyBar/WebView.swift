@@ -3,16 +3,34 @@ import WebKit
 import Combine
 import AppKit
 import UniformTypeIdentifiers
+import Network
 
 // MARK: - User-Agent
 // O Google bloqueia WKWebView com qualquer UA que contenha "Chrome/..." pois detecta
 // que o motor real é AppleWebKit/605.x (Safari), não o Blink do Chrome.
-// A solução correta é usar o UA do Safari nativo — aceito pelo Google, WhatsApp, Notion e Gemini.
+//
+// O WKWebView "puro" não envia os tokens `Version/x Safari/605.1.15`, e alguns
+// sites (login do Google, WhatsApp) tratam isso como navegador embutido. Em vez de
+// FIXAR uma string inteira (antes: `Version/17.6`, que ficou anos atrás do Safari
+// real e destoava dos recursos que o WebKit atual expõe), acrescentamos só esses
+// tokens via `applicationNameForUserAgent`: o resto do UA (WebKit, plataforma)
+// continua sendo o verdadeiro, e a versão acompanha o Safari instalado.
 
-private let kSafariUA =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) " +
-    "Version/17.6 Safari/605.1.15"
+private let kSafariApplicationName: String = {
+    var version: String?
+    if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Safari"),
+       let v = Bundle(url: url)?.infoDictionary?["CFBundleShortVersionString"] as? String {
+        version = v
+    }
+    if version == nil {
+        // Safari acompanha a versão maior do macOS (26.x, 27.x…).
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        version = "\(os.majorVersion).\(os.minorVersion)"
+    }
+    // O UA usa só maior.menor (27.2.1 → 27.2).
+    let mm = (version ?? "27.0").split(separator: ".").prefix(2).joined(separator: ".")
+    return "Version/\(mm) Safari/605.1.15"
+}()
 
 // MARK: - Utilitário de Endereço Local
 // Função livre (não duplicada): usada por TabManager, WebViewCoordinator e SecondaryViews.
@@ -130,6 +148,131 @@ func normalizedWebTabURL(from raw: String) -> URL? {
           let scheme = url.scheme?.lowercased(), kAllowedTabSchemes.contains(scheme),
           let host = url.host, !host.isEmpty else { return nil }
     return url
+}
+
+// MARK: - Dados de Navegação (cache do WKWebView)
+//
+// Cada aba usa o mesmo WKWebsiteDataStore.default() (é o que mantém você
+// logado nos serviços entre reinícios). Sites com Service Worker (WhatsApp
+// Web, Gmail, YouTube Music...) guardam ali um cache de mídia/assets para uso
+// offline — o `CacheStorage`/Fetch Cache — que cresce sem limite e pode chegar
+// a vários GB. Isso fica na sandbox do app (~/Library/Containers/…/Data/Library/WebKit),
+// não no bundle do app em si (~4 MB).
+
+public enum BrowsingDataManager {
+
+    /// Tipos "recriáveis": o site os reconstrói sozinho na próxima visita.
+    /// Limpar isso NÃO desloga de nada — cookies, localStorage e IndexedDB
+    /// (onde ficam sessão/login e histórico) não são tocados.
+    private static var reclaimableTypes: Set<String> {
+        [
+            WKWebsiteDataTypeDiskCache,
+            WKWebsiteDataTypeMemoryCache,
+            WKWebsiteDataTypeFetchCache,
+            // (WKWebsiteDataTypeOfflineWebApplicationCache foi removido: o AppCache
+            //  não existe mais no WebKit e o símbolo está obsoleto desde o macOS 26.2.)
+        ]
+    }
+
+    /// Tamanho em disco de todos os dados de navegação (soma bruta da pasta
+    /// `Library/WebKit` do container). A API pública do WKWebsiteDataStore não
+    /// expõe tamanho por registro, então medimos o disco diretamente — como é
+    /// a própria pasta do app (sandbox), não precisa de nenhuma permissão extra.
+    public static func totalDiskUsage(completion: @escaping (Int64) -> Void) {
+        DispatchQueue.global(qos: .utility).async {
+            let size: Int64
+            if let library = try? FileManager.default.url(
+                for: .libraryDirectory, in: .userDomainMask,
+                appropriateFor: nil, create: false) {
+                size = directorySize(library.appendingPathComponent("WebKit", isDirectory: true))
+            } else {
+                size = 0
+            }
+            DispatchQueue.main.async { completion(size) }
+        }
+    }
+
+    private static func directorySize(_ url: URL) -> Int64 {
+        guard let e = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileAllocatedSizeKey],
+            options: [], errorHandler: nil) else { return 0 }
+        var total: Int64 = 0
+        for case let fileURL as URL in e {
+            guard let v = try? fileURL.resourceValues(
+                forKeys: [.isRegularFileKey, .fileAllocatedSizeKey]),
+                v.isRegularFile == true else { continue }
+            total += Int64(v.fileAllocatedSize ?? 0)
+        }
+        return total
+    }
+
+    /// Limpa só o cache recriável (Service Worker Cache Storage + disco/memória).
+    /// Não desloga de nenhum site.
+    public static func clearReclaimableCache(completion: @escaping () -> Void) {
+        WKWebsiteDataStore.default().removeData(
+            ofTypes: reclaimableTypes, modifiedSince: .distantPast) {
+            DispatchQueue.main.async { completion() }
+        }
+    }
+
+    /// Limpa TUDO (cookies, sessão, histórico local) — desloga de todos os sites.
+    public static func clearEverything(completion: @escaping () -> Void) {
+        WKWebsiteDataStore.default().removeData(
+            ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) {
+            DispatchQueue.main.async { completion() }
+        }
+    }
+
+    // MARK: Limpeza por site
+    //
+    // O IndexedDB de um site (histórico/mídia — no WhatsApp Web é o que faz o
+    // volume real, não o cache) só o próprio site consegue diminuir seletivamente;
+    // pela API do WebKit só dá pra apagar o registro inteiro (equivale a fazer
+    // logout daquele site específico). Isso é mais cirúrgico que "Apagar Tudo",
+    // que zera TODAS as abas de uma vez.
+
+    public struct SiteRecord: Identifiable {
+        public var id: String { displayName }
+        public let displayName: String
+        public let dataTypes: Set<String>
+        fileprivate let record: WKWebsiteDataRecord
+
+        /// Sinal de "provavelmente pesado": IndexedDB, Service Worker e Fetch
+        /// Cache são os tipos que acumulam volume real (histórico, mídia
+        /// offline) — cookies/localStorage sozinhos são tipicamente poucos KB.
+        /// NÃO é o tamanho em bytes: o WebKit não expõe isso por site pra
+        /// nenhum app (nem o próprio Safari mostra isso fora da sua própria
+        /// UI de sistema, que usa API privada). Serve só para priorizar.
+        public var likelyHeavy: Bool {
+            dataTypes.contains(WKWebsiteDataTypeIndexedDBDatabases) ||
+            dataTypes.contains(WKWebsiteDataTypeServiceWorkerRegistrations) ||
+            dataTypes.contains(WKWebsiteDataTypeFetchCache)
+        }
+    }
+
+    /// Lista os sites com dados salvos — os "provavelmente pesados" primeiro,
+    /// depois em ordem alfabética.
+    public static func listSites(completion: @escaping ([SiteRecord]) -> Void) {
+        WKWebsiteDataStore.default().fetchDataRecords(
+            ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) { records in
+            let sites = records
+                .map { SiteRecord(displayName: $0.displayName, dataTypes: $0.dataTypes, record: $0) }
+                .sorted { a, b in
+                    if a.likelyHeavy != b.likelyHeavy { return a.likelyHeavy }
+                    return a.displayName.localizedCaseInsensitiveCompare(b.displayName) == .orderedAscending
+                }
+            DispatchQueue.main.async { completion(sites) }
+        }
+    }
+
+    /// Apaga os dados de UM site (equivale a deslogar só dele).
+    public static func clearSite(_ site: SiteRecord, completion: @escaping () -> Void) {
+        WKWebsiteDataStore.default().removeData(
+            ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), for: [site.record]) {
+            DispatchQueue.main.async { completion() }
+        }
+    }
 }
 
 // MARK: - DragAwareWebView
@@ -436,6 +579,71 @@ final class DragAwareWebView: WKWebView {
     }
 }
 
+// MARK: - Página de erro de carregamento
+// Antes, uma navegação que falhava só desligava o spinner: a aba ficava em
+// branco (ou parada na página anterior) sem nenhuma explicação nem como tentar
+// de novo. Esta página mostra o motivo e tem o botão "Tentar novamente".
+
+enum LoadFailurePage {
+
+    static func show(in webView: WKWebView, url: URL, tabTitle: String,
+                     title: String, detail: String, code: String) {
+        // baseURL = URL que falhou → `webView.url` continua sendo o site real
+        // (recarregar, favicon e metadados seguem funcionando).
+        webView.loadHTMLString(html(url: url, tabTitle: tabTitle, title: title,
+                                    detail: detail, code: code), baseURL: url)
+    }
+
+    private static func esc(_ s: String) -> String {
+        s.replacingOccurrences(of: "&", with: "&amp;")
+         .replacingOccurrences(of: "<", with: "&lt;")
+         .replacingOccurrences(of: ">", with: "&gt;")
+         .replacingOccurrences(of: "\"", with: "&quot;")
+         .replacingOccurrences(of: "'", with: "&#39;")
+    }
+
+    /// Literal de string JS (JSON) seguro para a URL.
+    private static func jsString(_ s: String) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: [s]),
+              let json = String(data: data, encoding: .utf8) else { return "\"\"" }
+        return String(json.dropFirst().dropLast())
+    }
+
+    private static func html(url: URL, tabTitle: String, title: String,
+                             detail: String, code: String) -> String {
+        // O JS vai dentro de um atributo HTML entre aspas → escapa para HTML também.
+        let onclick = esc("window.location.replace(\(jsString(url.absoluteString)))")
+        return """
+        <!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>\(esc(tabTitle))</title>
+        <style>
+          :root { color-scheme: light dark; }
+          html, body { height: 100%; margin: 0; }
+          body { display: flex; align-items: center; justify-content: center;
+                 font: 15px -apple-system, system-ui, sans-serif;
+                 background: Canvas; color: CanvasText; }
+          .card { max-width: 460px; padding: 32px; text-align: center; }
+          .icon { font-size: 44px; }
+          h1 { font-size: 20px; margin: 10px 0 6px; }
+          p { opacity: .75; line-height: 1.45; margin: 6px 0; }
+          .host { font-weight: 600; opacity: 1; }
+          code { font-size: 11.5px; opacity: .55; word-break: break-word; }
+          button { margin-top: 18px; font: inherit; padding: 9px 20px; border: 0;
+                   border-radius: 9px; background: #0a84ff; color: #fff; cursor: pointer; }
+          button:hover { filter: brightness(1.1); }
+        </style></head><body><div class="card">
+          <div class="icon">⚠️</div>
+          <h1>\(esc(title))</h1>
+          <p class="host">\(esc(url.host ?? url.absoluteString))</p>
+          <p>\(esc(detail))</p>
+          <p><code>\(esc(code))</code></p>
+          <button onclick="\(onclick)">Tentar novamente</button>
+        </div></body></html>
+        """
+    }
+}
+
 // MARK: - TabManager
 
 /// Gerencia os `WKWebView` de cada aba, mantendo-os vivos em memória.
@@ -458,6 +666,169 @@ public final class TabManager: ObservableObject {
 
     public init() {}
 
+    // MARK: Ciclo de vida — inatividade, rede e suspensão do Mac
+
+    /// Informa se o painel está na tela (injetado pela ContentView). A aba que o
+    /// usuário está VENDO nunca é descarregada; com o painel escondido, ela
+    /// também passa a contar como inativa.
+    public var panelVisibleProvider: () -> Bool = { true }
+
+    private var lastActive: [UUID: Date] = [:]
+    private var sweepTimer: Timer?
+    private var pathMonitor: NWPathMonitor?
+    private var wakeObserver: NSObjectProtocol?
+    private var wasOffline = false
+    private var started    = false
+
+    /// Abas cuja última navegação falhou por conexão → recarregadas quando a
+    /// rede volta ou o Mac acorda do repouso.
+    private var failedTabs: [UUID: URL] = [:]
+    private var terminationTimes: [UUID: [Date]] = [:]
+
+    /// Inicia o varredor de inatividade e os monitores de rede/repouso (idempotente).
+    public func start() {
+        guard !started else { return }
+        started = true
+
+        let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            self?.sweepInactiveTabs()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        sweepTimer = timer
+
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if path.status == .satisfied {
+                    if self.wasOffline { self.wasOffline = false; self.retryFailedTabs(after: 2) }
+                } else {
+                    self.wasOffline = true
+                }
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "br.com.easybar.netmonitor"))
+        pathMonitor = monitor
+
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            // A rede leva alguns segundos para voltar depois do repouso.
+            self?.retryFailedTabs(after: 5)
+        }
+    }
+
+    /// Marca a aba como "usada agora" (zera o relógio de inatividade).
+    public func touch(_ id: UUID?) {
+        if let id { lastActive[id] = Date() }
+    }
+
+    public func selectionChanged(from old: UUID?, to new: UUID?) {
+        touch(old)   // conta a inatividade a partir do momento em que saiu dela
+        touch(new)
+    }
+
+    private func sweepInactiveTabs() {
+        guard let settings else { return }
+        // Descarregar destruiria o WKWebView dono de um download em andamento.
+        guard DownloadsManager.shared.activeCount == 0 else { return }
+
+        let now          = Date()
+        let panelVisible = panelVisibleProvider()
+
+        for tab in settings.tabs {
+            guard let wv = webViews[tab.id], !tab.isSuspended,
+                  let minutes = settings.effectiveAutoSuspendMinutes(for: tab) else { continue }
+
+            // A aba que o usuário está vendo agora nunca é descarregada.
+            if tab.id == settings.selectedTabId && panelVisible {
+                lastActive[tab.id] = now
+                continue
+            }
+
+            let last = lastActive[tab.id] ?? now
+            lastActive[tab.id] = last
+            guard now.timeIntervalSince(last) >= TimeInterval(minutes * 60) else { continue }
+
+            // Protege aba em uso "invisível": microfone/câmera ativos ou mídia tocando
+            // (ex.: Spotify tocando com o painel escondido).
+            if wv.microphoneCaptureState == .active || wv.cameraCaptureState == .active {
+                lastActive[tab.id] = now
+                continue
+            }
+            let id = tab.id
+            wv.requestMediaPlaybackState { [weak self] state in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if state == .playing { self.lastActive[id] = Date() }
+                    else                 { self.autoSuspend(id) }
+                }
+            }
+        }
+    }
+
+    private func autoSuspend(_ id: UUID) {
+        guard let settings,
+              let idx = settings.tabs.firstIndex(where: { $0.id == id }),
+              !settings.tabs[idx].isSuspended, webViews[id] != nil else { return }
+        // O usuário pode ter voltado para a aba enquanto esperávamos a resposta de mídia.
+        if id == settings.selectedTabId && panelVisibleProvider() { return }
+
+        NSLog("[EasyBar] Descarregando aba inativa: %@", settings.tabs[idx].title)
+        settings.autoSuspendedTabIDs.insert(id)
+        settings.tabs[idx].isSuspended = true
+        suspendTab(id)
+    }
+
+    // MARK: Falhas de carregamento / queda do processo web
+
+    func recordFailure(tabId: UUID, url: URL) { failedTabs[tabId] = url }
+    func recordSuccess(tabId: UUID)           { failedTabs.removeValue(forKey: tabId) }
+
+    private func retryFailedTabs(after delay: TimeInterval) {
+        guard !failedTabs.isEmpty else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            for (id, url) in self.failedTabs {
+                guard let wv = self.webViews[id] else { self.failedTabs.removeValue(forKey: id); continue }
+                NSLog("[EasyBar] Conexão de volta — recarregando aba que havia falhado: %@",
+                      url.host ?? url.absoluteString)
+                wv.load(URLRequest(url: url))
+            }
+        }
+    }
+
+    /// O WebKit/sistema encerrou o processo web da aba (quase sempre por falta de
+    /// memória). Sem tratar isso a aba fica em branco para sempre.
+    func handleProcessTermination(tabId: UUID, webView: WKWebView) {
+        let now = Date()
+        var times = (terminationTimes[tabId] ?? []).filter { now.timeIntervalSince($0) < 120 }
+        times.append(now)
+        terminationTimes[tabId] = times
+
+        let tabInfo = settings?.tabs.first(where: { $0.id == tabId })
+        let url     = webView.url ?? tabInfo?.url
+        NSLog("[EasyBar] Processo web da aba \"%@\" encerrado pelo sistema (%d vez(es) em 2 min)",
+              tabInfo?.title ?? "?", times.count)
+
+        // Em loop de quedas: não insiste (só piora a pressão de memória).
+        if times.count > 3, let url {
+            LoadFailurePage.show(
+                in: webView, url: url, tabTitle: tabInfo?.title ?? "Aba",
+                title: "A aba foi encerrada várias vezes",
+                detail: "O macOS está com pouca memória e derrubou esta aba repetidamente. "
+                      + "Suspenda abas que você não usa ou feche outros apps e tente de novo.",
+                code: "WebContent process terminated ×\(times.count)")
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self, weak webView] in
+            guard let self, let webView, self.webViews[tabId] === webView else { return }
+            if webView.url != nil { webView.reload() }
+            else if let url       { webView.load(self.buildRequest(for: url)) }
+        }
+    }
+
     // MARK: Acesso / Criação
 
     public func getWebView(for tab: WebTab) -> WKWebView {
@@ -468,13 +839,13 @@ public final class TabManager: ObservableObject {
 
         let config  = makeConfiguration()
         let webView = DragAwareWebView(frame: .zero, configuration: config)
-        webView.customUserAgent                     = kSafariUA
         webView.allowsBackForwardNavigationGestures = true
         webView.allowsMagnification                 = true
         webView.navigationDelegate                  = coordinator
         webView.uiDelegate                          = coordinator
 
         webViews[tab.id] = webView
+        lastActive[tab.id] = Date()
         // NÃO chamar load() aqui — o WKWebView tem frame:.zero nesse momento.
         // load() é disparado em DragAwareWebView.layout() quando o frame
         // se torna não-nulo pela primeira vez (após SwiftUI fazer o layout).
@@ -496,6 +867,9 @@ public final class TabManager: ObservableObject {
         webViews.removeValue(forKey: tabId)
         coordinators.removeValue(forKey: tabId)
         loadingStates.removeValue(forKey: tabId)
+        lastActive.removeValue(forKey: tabId)
+        failedTabs.removeValue(forKey: tabId)
+        terminationTimes.removeValue(forKey: tabId)
     }
 
     // MARK: Configuração do WKWebView
@@ -504,23 +878,13 @@ public final class TabManager: ObservableObject {
         let config = WKWebViewConfiguration()
         config.websiteDataStore                         = WKWebsiteDataStore.default()
         config.mediaTypesRequiringUserActionForPlayback = []
-        config.userContentController.addUserScript(
-            WKUserScript(source: spoofScript(),
-                         injectionTime: .atDocumentStart,
-                         forMainFrameOnly: false)
-        )
+        config.applicationNameForUserAgent              = kSafariApplicationName
+        // (Removido) script que redefinia `navigator.webdriver`: o WKWebView já
+        // devolve `false`, e `Object.defineProperty(navigator, …)` cria uma
+        // propriedade PRÓPRIA em `navigator` — assinatura de adulteração que o
+        // Safari de verdade não tem e que as defesas anti-bot do Google detectam.
+        // Era injetado em todos os frames, inclusive nos do login do Google.
         return config
-    }
-
-    private func spoofScript() -> String {
-        """
-        (function() {
-            Object.defineProperty(navigator, 'webdriver', {
-                get: function() { return false; },
-                configurable: true
-            });
-        })();
-        """
     }
 
     // MARK: URLRequest
@@ -646,6 +1010,78 @@ public final class WebViewCoordinator: NSObject,
     /// Chave para `objc_setAssociatedObject` (endereço estável e único).
     private static var authDelegateKey: UInt8 = 0
 
+    /// `true` enquanto a página de erro (loadHTMLString) está sendo carregada.
+    fileprivate var isShowingFailurePage = false
+
+    private static var didLogUserAgent = false
+    /// Registra uma vez o UA efetivo — para conferir no log o que os sites recebem.
+    fileprivate static func logUserAgentOnce(_ webView: WKWebView) {
+        guard !didLogUserAgent else { return }
+        didLogUserAgent = true
+        webView.evaluateJavaScript("navigator.userAgent") { ua, _ in
+            NSLog("[EasyBar] User-Agent efetivo: %@", (ua as? String) ?? "?")
+        }
+    }
+
+    // MARK: Falha de carregamento → página de erro com "Tentar novamente"
+
+    fileprivate func presentLoadFailure(_ webView: WKWebView, error: Error) {
+        let ns = error as NSError
+        // Não são falhas de verdade: cancelamento, conversão em download, etc.
+        if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled { return }
+        if ns.domain == "WebKitErrorDomain" && (100...102).contains(ns.code) { return }
+        guard let failedURL = (ns.userInfo[NSURLErrorFailingURLErrorKey] as? URL) ?? webView.url,
+              let scheme = failedURL.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else { return }
+
+        let info = Self.describe(ns)
+        NSLog("[EasyBar] Falha ao carregar %@ — %@ %d (%@)",
+              failedURL.host ?? failedURL.absoluteString, ns.domain, ns.code, ns.localizedDescription)
+
+        // Falha de conexão: recarrega sozinho quando a rede voltar / o Mac acordar.
+        if info.connectivity { tabManager?.recordFailure(tabId: tab.id, url: failedURL) }
+
+        isShowingFailurePage = true
+        let tabTitle = tabManager?.settings?.tabs.first(where: { $0.id == tab.id })?.title ?? "Falha ao carregar"
+        LoadFailurePage.show(
+            in: webView, url: failedURL, tabTitle: tabTitle,
+            title: info.title, detail: info.detail,
+            code: "\(ns.domain) \(ns.code) — \(ns.localizedDescription)")
+    }
+
+    private static func describe(_ ns: NSError) -> (title: String, detail: String, connectivity: Bool) {
+        guard ns.domain == NSURLErrorDomain else {
+            return ("Não foi possível abrir a página",
+                    "Ocorreu um erro ao carregar. Tente novamente.", false)
+        }
+        switch ns.code {
+        case NSURLErrorNotConnectedToInternet:
+            return ("Sem conexão com a internet",
+                    "Verifique sua rede. Vou recarregar esta aba automaticamente quando a conexão voltar.", true)
+        case NSURLErrorNetworkConnectionLost:
+            return ("A conexão foi interrompida",
+                    "A rede caiu durante o carregamento. Vou tentar de novo quando ela voltar.", true)
+        case NSURLErrorTimedOut:
+            return ("O site demorou demais para responder",
+                    "A conexão está lenta ou o servidor não respondeu a tempo.", true)
+        case NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed:
+            return ("Não foi possível encontrar o servidor",
+                    "Confira o endereço e a sua conexão (ou o DNS).", true)
+        case NSURLErrorCannotConnectToHost:
+            return ("Não foi possível conectar ao servidor",
+                    "O servidor recusou a conexão ou está fora do ar.", true)
+        case NSURLErrorSecureConnectionFailed,
+             NSURLErrorServerCertificateHasBadDate, NSURLErrorServerCertificateUntrusted,
+             NSURLErrorServerCertificateHasUnknownRoot, NSURLErrorServerCertificateNotYetValid,
+             NSURLErrorClientCertificateRejected, NSURLErrorClientCertificateRequired:
+            return ("Falha na conexão segura (SSL/TLS)",
+                    "Não foi possível estabelecer uma conexão segura com o site.", false)
+        default:
+            return ("Não foi possível abrir a página",
+                    "Ocorreu um erro de rede ao carregar. Tente novamente.", false)
+        }
+    }
+
     init(tab: WebTab, tabManager: TabManager) {
         self.tab        = tab
         self.tabManager = tabManager
@@ -674,6 +1110,13 @@ public final class WebViewCoordinator: NSObject,
                 userInfo: ["tabId": tabId]
             )
             webView.window?.makeFirstResponder(webView)
+
+            // Carregar a PRÓPRIA página de erro também termina em didFinish —
+            // isso não pode contar como sucesso (senão cancelaria o retry).
+            if self.isShowingFailurePage { self.isShowingFailurePage = false }
+            else                         { self.tabManager?.recordSuccess(tabId: tabId) }
+
+            Self.logUserAgentOnce(webView)
         }
     }
 
@@ -684,7 +1127,13 @@ public final class WebViewCoordinator: NSObject,
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.tabManager?.loadingStates[tabId] = false
+            self.presentLoadFailure(webView, error: error)
         }
+    }
+
+    /// O WebKit encerrou o processo web desta aba (falta de memória, etc.).
+    public func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        tabManager?.handleProcessTermination(tabId: tab.id, webView: webView)
     }
 
     public func webView(_ webView: WKWebView,
@@ -723,7 +1172,14 @@ public final class WebViewCoordinator: NSObject,
               failed.scheme == "https",
               let host = failed.host,
               isLocalNetworkAddress(host),
-              !httpDowngradedHosts.contains(host) else { return }
+              !httpDowngradedHosts.contains(host) else {
+            // Não é o caso do fallback HTTP: mostra a falha ao usuário (antes ficava
+            // uma página em branco, sem mensagem nem como tentar de novo).
+            DispatchQueue.main.async { [weak self] in
+                self?.presentLoadFailure(webView, error: error)
+            }
+            return
+        }
 
         httpDowngradedHosts.insert(host)
         var components = URLComponents(url: failed, resolvingAgainstBaseURL: false)
@@ -1079,8 +1535,8 @@ public final class WebViewCoordinator: NSObject,
 
         let isAuth = url.map { self.isAuthDomain($0) } ?? false
         if looksLikeDownload && !isAuth {
+            configuration.applicationNameForUserAgent = kSafariApplicationName
             let popup = WKWebView(frame: .zero, configuration: configuration)
-            popup.customUserAgent   = kSafariUA
             popup.navigationDelegate = self
             popup.uiDelegate         = self
             retainTransientPopup(popup)
@@ -1090,8 +1546,8 @@ public final class WebViewCoordinator: NSObject,
         guard let url else { return nil }
 
         if isAuthDomain(url) {
+            configuration.applicationNameForUserAgent = kSafariApplicationName
             let popupWebView = WKWebView(frame: .zero, configuration: configuration)
-            popupWebView.customUserAgent = kSafariUA
 
             let authPanel = NSPanel(
                 contentRect: NSRect(x: 0, y: 0, width: 520, height: 660),

@@ -2,6 +2,11 @@ import SwiftUI
 import AppKit
 import Carbon
 
+extension Notification.Name {
+    /// Disparada quando o painel desliza para a tela.
+    static let easyBarPanelDidShow = Notification.Name("EasyBarPanelDidShow")
+}
+
 // MARK: - NSPanel que aceita eventos de teclado
 
 class SlidePanel: NSPanel {
@@ -194,6 +199,8 @@ class SlideWindowController: NSWindowController, NSWindowDelegate {
         let visible = SlideWindowController.visibleFrame(for: appSettings, screen: screen)
 
         isVisible = true
+        // A ContentView reativa a aba selecionada se ela foi descarregada por inatividade.
+        NotificationCenter.default.post(name: .easyBarPanelDidShow, object: nil)
 
         panel.setFrame(hidden, display: false)
         panel.orderFrontRegardless()

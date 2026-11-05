@@ -2,7 +2,7 @@
 
 Alternativa gratuita ao [Slidepad](https://slidepad.app) para macOS. Painel lateral deslizante com abas de navegacao web, timer Pomodoro e bloco de notas.
 
-**Versao atual: 1.6.1**
+**Versao atual: 1.7.0**
 
 ## Funcionalidades
 
@@ -17,7 +17,10 @@ Alternativa gratuita ao [Slidepad](https://slidepad.app) para macOS. Painel late
 - Favicon automatico via Google Favicons API
 - Drag & drop para reordenar abas
 - Arrastar arquivos do Finder direto para a conversa (WhatsApp, Telegram, Gmail...)
-- Suspensao de abas para economizar memoria
+- Suspensao manual de abas para economizar memoria
+- **Economia de memoria:** abas inativas sao descarregadas automaticamente (padrao: 30 min), com tempo configuravel e opcao de nunca descarregar uma aba especifica (botao direito na aba)
+- Pagina de erro com "Tentar novamente"; recarrega sozinha quando a rede volta ou o Mac acorda, e recupera abas derrubadas por falta de memoria
+- Microfone e camera disponiveis para os sites (ex.: voz no Gemini)
 
 ### Downloads
 - Janela de Downloads com progresso, "Mostrar no Finder" e "Abrir arquivo"
@@ -25,6 +28,11 @@ Alternativa gratuita ao [Slidepad](https://slidepad.app) para macOS. Painel late
 - Links de download hospedados em CDNs (Slack, Google, S3) nao sao mais bloqueados
 - Pasta padrao `~/Downloads/EasyBar`, configuravel
 - Opcao de perguntar o destino a cada download ou salvar direto
+
+### Armazenamento de navegacao
+- Mostra quanto espaco o cache de navegacao ocupa
+- "Limpar Cache" apaga so o que e recriavel (voce continua logado)
+- "Gerenciar por site" apaga os dados de um site especifico; os que costumam pesar vem marcados
 
 ### Timer Pomodoro
 - Opcoes de 5, 10, 15, 20 e 25 minutos

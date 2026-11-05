@@ -207,10 +207,32 @@ struct ContentView: View {
         // MARK: Ciclo de vida
         .onAppear {
             tabManager.settings = settings
+            // Painel escondido conta como "inativo" para o descarregamento automático.
+            // (variável local: capturar a propriedade `controller` da struct puxaria `self`
+            // inteiro com referência forte e criaria um ciclo de retenção)
+            let panelController = controller
+            tabManager.panelVisibleProvider = { [weak panelController] in panelController?.isVisible ?? true }
+            tabManager.touch(settings.selectedTabId)
+            tabManager.start()
             // Garante que sempre há uma aba selecionada ao abrir
             if settings.selectedTabId == nil ||
                !settings.tabs.contains(where: { $0.id == settings.selectedTabId }) {
                 settings.selectedTabId = settings.tabs.first?.id
+            }
+        }
+
+        // MARK: Inatividade: troca de aba e reaparecimento do painel
+        .onChange(of: settings.selectedTabId) { old, new in
+            tabManager.selectionChanged(from: old, to: new)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .easyBarPanelDidShow)) { _ in
+            tabManager.touch(settings.selectedTabId)
+            // Se a aba aberta foi descarregada por inatividade, volta sozinha —
+            // sem precisar clicar em "Recarregar Aba".
+            if let id = settings.selectedTabId,
+               settings.autoSuspendedTabIDs.contains(id),
+               let tab = settings.tabs.first(where: { $0.id == id }), tab.isSuspended {
+                reactivateTab(tab)
             }
         }
 
@@ -536,6 +558,13 @@ struct TabButton: View {
                         .aspectRatio(contentMode: .fit)
                         .frame(width: 20, height: 20)
 
+                    if tab.autoSuspendMinutes == 0 {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 7))
+                            .foregroundColor(.orange)
+                            .offset(x: 11, y: -11)
+                    }
+
                     if tab.isSuspended {
                         Color.black.opacity(0.4)
                             .frame(width: 22, height: 22)
@@ -561,7 +590,7 @@ struct TabButton: View {
             )
         }
         .buttonStyle(PlainButtonStyle())
-        .help(tab.title)
+        .help(tab.autoSuspendMinutes == 0 ? "\(tab.title) — nunca descarregada automaticamente" : tab.title)
         .contextMenu {
             Button("Recarregar") {
                 if let index = settings.tabs.firstIndex(where: { $0.id == tab.id }) {
@@ -605,6 +634,8 @@ struct TabButton: View {
                     }
                 }
             }
+
+            AutoSuspendPolicyMenu(settings: settings, tabID: tab.id)
 
             Divider()
 
@@ -692,5 +723,43 @@ struct AppVisualEffectView: NSViewRepresentable {
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
         nsView.material     = material
         nsView.blendingMode = blendingMode
+    }
+}
+
+
+// MARK: - Política de descarregamento automático de UMA aba
+
+/// Submenu para escolher quando (ou se) uma aba é descarregada por inatividade.
+/// Usado no menu de contexto da aba e na lista de abas das Configurações.
+struct AutoSuspendPolicyMenu: View {
+    @ObservedObject var settings: AppSettings
+    let tabID: UUID
+    var title: String = "Descarregar automaticamente"
+
+    private var current: Int? { settings.tabs.first(where: { $0.id == tabID })?.autoSuspendMinutes }
+
+    private var globalLabel: String {
+        settings.autoSuspendEnabled ? AutoSuspend.label(settings.autoSuspendMinutes) : "desligado"
+    }
+
+    var body: some View {
+        Menu(title) {
+            item("Usar o padrão (\(globalLabel))", value: nil)
+            item("Nunca descarregar esta aba", value: 0)
+            Divider()
+            ForEach(AutoSuspend.choices, id: \.self) { minutes in
+                item("Após \(AutoSuspend.label(minutes)) sem uso", value: minutes)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func item(_ label: String, value: Int?) -> some View {
+        Button {
+            guard let i = settings.tabs.firstIndex(where: { $0.id == tabID }) else { return }
+            settings.tabs[i].autoSuspendMinutes = value
+        } label: {
+            if current == value { Label(label, systemImage: "checkmark") } else { Text(label) }
+        }
     }
 }

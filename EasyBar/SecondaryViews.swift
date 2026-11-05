@@ -542,6 +542,13 @@ struct SettingsWindow: View {
     @State private var importError:    String? = nil
     @State private var showImportOK    = false
     @State private var downloadFolderChanged = false
+    @State private var browsingDataSize:    Int64?  = nil
+    @State private var isClearingCache      = false
+    @State private var cacheClearedMessage: String? = nil
+    @State private var sitesExpanded        = false
+    @State private var sitesLoaded          = false
+    @State private var siteRecords:  [BrowsingDataManager.SiteRecord] = []
+    @State private var siteBeingCleared: String? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -699,6 +706,136 @@ struct SettingsWindow: View {
                         .padding(8)
                     }
 
+                    // Armazenamento de Navegação
+                    GroupBox(label: Text("Armazenamento de Navegação").bold()) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Sites com histórico/mídia offline (WhatsApp, Gmail, YouTube Music…) guardam cache aqui dentro do app. Isso pode crescer bastante com o tempo.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+
+                            HStack(spacing: 8) {
+                                Image(systemName: "internaldrive")
+                                    .foregroundColor(.accentColor)
+                                if let size = browsingDataSize {
+                                    Text(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
+                                        .font(.system(.body, design: .monospaced))
+                                } else {
+                                    ProgressView().controlSize(.small)
+                                    Text("Calculando…").font(.caption).foregroundColor(.secondary)
+                                }
+                                Spacer()
+                            }
+
+                            HStack(spacing: 8) {
+                                Button(action: clearReclaimableCache) {
+                                    Label("Limpar Cache", systemImage: "arrow.3.trianglepath")
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(isClearingCache)
+
+                                Button(action: confirmClearEverything) {
+                                    Label("Apagar Tudo (Sair de Todos os Sites)", systemImage: "person.crop.circle.badge.xmark")
+                                }
+                                .buttonStyle(.bordered)
+                                .foregroundColor(.red)
+                                .disabled(isClearingCache)
+
+                                if isClearingCache { ProgressView().controlSize(.small) }
+
+                                if let msg = cacheClearedMessage {
+                                    Text(msg)
+                                        .font(.caption)
+                                        .foregroundColor(.green)
+                                        .transition(.opacity)
+                                }
+                            }
+
+                            Text("\"Limpar Cache\" só apaga dados recriáveis — você continua logado em tudo. \"Apagar Tudo\" desloga de todos os sites (o WhatsApp, por exemplo, vai pedir para escanear o QR code de novo).")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+
+                            Divider()
+
+                            DisclosureGroup(isExpanded: $sitesExpanded) {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text("O WebKit não informa o tamanho de cada site (nem para o Safari isso é público) — os marcados com 🗄️ têm histórico/banco local (IndexedDB) ou cache de app (Service Worker), que é o que costuma pesar; sem o selo, é tipicamente só login (poucos KB). Ao apagar um, mostro quanto foi liberado de verdade.")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+
+                                    if siteRecords.isEmpty {
+                                        Text(sitesLoaded ? "Nenhum dado salvo." : "Carregando sites…")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                            .padding(.top, 4)
+                                    } else {
+                                        ForEach(siteRecords) { site in
+                                            HStack {
+                                                if site.likelyHeavy {
+                                                    Text("🗄️").font(.caption)
+                                                        .help("Tem histórico/banco local ou cache de app — provável maior consumo")
+                                                }
+                                                Text(site.displayName)
+                                                    .font(.caption)
+                                                Spacer()
+                                                if siteBeingCleared == site.id {
+                                                    ProgressView().controlSize(.small)
+                                                } else {
+                                                    Button(action: { confirmClearSite(site) }) {
+                                                        Image(systemName: "trash")
+                                                    }
+                                                    .buttonStyle(.borderless)
+                                                    .foregroundColor(.red)
+                                                    .help("Sair de \(site.displayName) e apagar os dados dele")
+                                                }
+                                            }
+                                            .padding(.vertical, 2)
+                                            Divider()
+                                        }
+                                    }
+                                }
+                                .padding(.top, 6)
+                            } label: {
+                                Text("Gerenciar por site")
+                                    .font(.caption)
+                            }
+                            .onChange(of: sitesExpanded) { _, expanded in
+                                if expanded { refreshSiteList() }
+                            }
+                        }
+                        .padding(8)
+                        .onAppear(perform: refreshBrowsingDataSize)
+                    }
+
+                    // Economia de Memória
+                    GroupBox(label: Text("Economia de Memória").bold()) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Com muitas abas abertas o macOS fica sem memória e o WebKit passa a derrubar ou travar páginas pesadas (Gemini, WhatsApp, Notion…). Descarregar abas que você não usa há um tempo evita isso — elas recarregam sozinhas quando você volta.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+
+                            Toggle("Descarregar abas inativas automaticamente", isOn: $settings.autoSuspendEnabled)
+
+                            HStack {
+                                Text("Descarregar após")
+                                Picker("", selection: $settings.autoSuspendMinutes) {
+                                    ForEach(AutoSuspend.choices, id: \.self) { m in
+                                        Text(AutoSuspend.label(m)).tag(m)
+                                    }
+                                }
+                                .labelsHidden()
+                                .frame(width: 110)
+                                Text("sem uso")
+                                    .foregroundColor(.secondary)
+                            }
+                            .disabled(!settings.autoSuspendEnabled)
+
+                            Text("A aba que você está vendo nunca é descarregada, nem abas tocando áudio/vídeo (Spotify) ou usando microfone/câmera. Para uma aba específica, clique nela com o botão direito → \"Descarregar automaticamente\" (ou use a lista de abas abaixo) para fixá-la ou dar um tempo próprio.")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        .padding(8)
+                    }
+
                     // Restaurar Padrões
                     GroupBox(label: Text("Restaurar Padrões").bold()) {
                         VStack(alignment: .leading, spacing: 12) {
@@ -800,10 +937,17 @@ struct SettingsWindow: View {
                                             .lineLimit(1)
                                         Spacer()
                                         if tab.isSuspended {
-                                            Text("Suspensa")
+                                            Text(settings.autoSuspendedTabIDs.contains(tab.id) ? "Descarregada" : "Suspensa")
                                                 .font(.caption)
                                                 .foregroundColor(.secondary)
                                         }
+                                        Text(autoSuspendSummary(for: tab))
+                                            .font(.caption2)
+                                            .foregroundColor(tab.autoSuspendMinutes == 0 ? .orange : .secondary)
+                                        AutoSuspendPolicyMenu(settings: settings, tabID: tab.id, title: "⏱")
+                                            .menuStyle(.borderlessButton)
+                                            .fixedSize()
+                                            .help("Quando descarregar esta aba por inatividade")
                                     }
                                     .padding(.vertical, 2)
                                 }
@@ -855,6 +999,101 @@ struct SettingsWindow: View {
         settings.saveSettings()
         controller?.applySettings()
         presentationMode.wrappedValue.dismiss()
+    }
+
+    /// Resumo curto da política de descarregamento de uma aba, para a lista.
+    func autoSuspendSummary(for tab: WebTab) -> String {
+        switch tab.autoSuspendMinutes {
+        case .some(0):      return "📌 nunca"
+        case .some(let m):  return "após \(AutoSuspend.label(m))"
+        case .none:
+            return settings.autoSuspendEnabled ? "padrão (\(AutoSuspend.label(settings.autoSuspendMinutes)))" : "padrão (off)"
+        }
+    }
+
+    // MARK: - Armazenamento de Navegação
+
+    func refreshBrowsingDataSize() {
+        browsingDataSize = nil
+        BrowsingDataManager.totalDiskUsage { size in
+            browsingDataSize = size
+        }
+    }
+
+    func clearReclaimableCache() {
+        isClearingCache      = true
+        cacheClearedMessage  = nil
+        BrowsingDataManager.clearReclaimableCache {
+            isClearingCache     = false
+            cacheClearedMessage = "Cache limpo!"
+            refreshBrowsingDataSize()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                withAnimation { cacheClearedMessage = nil }
+            }
+        }
+    }
+
+    func confirmClearEverything() {
+        let alert = NSAlert()
+        alert.messageText     = "Apagar todos os dados de navegação?"
+        alert.informativeText = "Você será desconectado de TODOS os sites nas suas abas (WhatsApp, Gmail, etc. vão pedir login/QR code de novo). As abas e configurações do EasyBar não são afetadas. Esta ação não pode ser desfeita."
+        alert.alertStyle      = .critical
+        alert.addButton(withTitle: "Apagar Tudo")
+        alert.addButton(withTitle: "Cancelar")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        isClearingCache     = true
+        cacheClearedMessage = nil
+        BrowsingDataManager.clearEverything {
+            isClearingCache     = false
+            cacheClearedMessage = "Dados apagados!"
+            refreshBrowsingDataSize()
+            if sitesExpanded { refreshSiteList() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                withAnimation { cacheClearedMessage = nil }
+            }
+        }
+    }
+
+    func refreshSiteList() {
+        BrowsingDataManager.listSites { sites in
+            siteRecords = sites
+            sitesLoaded = true
+        }
+    }
+
+    func confirmClearSite(_ site: BrowsingDataManager.SiteRecord) {
+        let alert = NSAlert()
+        alert.messageText     = "Sair de \(site.displayName)?"
+        alert.informativeText = "Os dados salvos desse site (sessão, histórico local) serão apagados. Da próxima vez você vai precisar fazer login (ou escanear o QR code, no caso do WhatsApp) só nele — os outros sites não são afetados. Esta ação não pode ser desfeita."
+        alert.alertStyle      = .warning
+        alert.addButton(withTitle: "Sair e Apagar")
+        alert.addButton(withTitle: "Cancelar")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        siteBeingCleared = site.id
+        let sizeBefore = browsingDataSize
+        BrowsingDataManager.clearSite(site) {
+            siteBeingCleared = nil
+            refreshSiteList()
+            BrowsingDataManager.totalDiskUsage { sizeAfter in
+                browsingDataSize = sizeAfter
+                // Espaço realmente liberado por ESTA limpeza, medido no disco
+                // (não é estimativa — é o antes/depois de verdade).
+                if let before = sizeBefore, before > sizeAfter {
+                    let freed = ByteCountFormatter.string(
+                        fromByteCount: before - sizeAfter, countStyle: .file)
+                    cacheClearedMessage = "\(site.displayName): liberou \(freed)"
+                } else {
+                    cacheClearedMessage = "\(site.displayName) limpo!"
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                    withAnimation { cacheClearedMessage = nil }
+                }
+            }
+        }
     }
 
     func exportSettings() {

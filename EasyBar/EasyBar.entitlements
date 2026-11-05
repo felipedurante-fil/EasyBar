@@ -17,5 +17,12 @@
 	<!-- Gravação na pasta Downloads do usuário (destino padrão de downloads do WKDownload) -->
 	<key>com.apple.security.files.downloads.read-write</key>
 	<true/>
+
+	<!-- Microfone e câmera para sites (Gemini Live, WhatsApp/Meet, ditado). Sem estas
+	     entitlements o WKWebView sandboxed nem chega a pedir permissão ao usuário. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<key>com.apple.security.device.camera</key>
+	<true/>
 </dict>
 </plist>
