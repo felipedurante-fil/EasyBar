@@ -6,7 +6,7 @@ import ServiceManagement
 
 // MARK: - Versão do Aplicativo
 /// Fonte única de verdade para a versão. Usada em SettingsSnapshot e no About.
-public let kAppVersion = "1.7.0"
+public let kAppVersion = "1.7.1"
 
 // MARK: - Direção do Deslizamento
 

@@ -42,6 +42,15 @@ class SlideWindowController: NSWindowController, NSWindowDelegate {
     private static var eventHandlerRef: EventHandlerRef?
     private static weak var sharedInstance: SlideWindowController?
 
+    // Estrutura da janela + estado do deslize recortado
+    private var containerView: NSView?
+    private var hostingView:   NSView?
+    private var slideDriver:   SlideDriver?
+    /// Frame COMPLETO (sem recorte) do painel no último passo do deslize; permite
+    /// reverter no meio da animação sem "pulo". `nil` quando em repouso.
+    private var lastFullFrame: NSRect?
+    private var isSlideAnimating = false
+
     init(settings: AppSettings) {
         self.appSettings = settings
 
@@ -77,12 +86,24 @@ class SlideWindowController: NSWindowController, NSWindowDelegate {
         // conflitava com o pipeline de composição do WKWebView no macOS 26, deixando
         // o conteúdo em branco. O efeito visual (frosted glass) é obtido via
         // SwiftUI .background(.ultraThinMaterial) em ContentView.
+        //
+        // O NSHostingView agora fica dentro de um contêiner NSView SIMPLES (sem
+        // wantsLayer e sem máscara de camada — nada que mexa na composição do
+        // WKWebView). Em repouso ele ocupa o contêiner inteiro. Durante o deslize
+        // "recortado" (ver runClippedSlide) o contêiner fica menor que o conteúdo e
+        // é a própria borda da JANELA que recorta — sem relayout da página.
         let hostingView = NSHostingView(
             rootView: ContentView(settings: settings, controller: self)
         )
+        let container = NSView(frame: NSRect(origin: .zero, size: hiddenFrame.size))
+        container.autoresizesSubviews = true
+        hostingView.frame = container.bounds
         hostingView.translatesAutoresizingMaskIntoConstraints = true
         hostingView.autoresizingMask = [.width, .height]
-        panel.contentView = hostingView
+        container.addSubview(hostingView)
+        panel.contentView = container
+        self.containerView = container
+        self.hostingView   = hostingView
 
         SlideWindowController.sharedInstance = self
         installGlobalEventHandlerOnce()
@@ -185,6 +206,60 @@ class SlideWindowController: NSWindowController, NSWindowDelegate {
         suppressedLevel = nil
     }
 
+    // MARK: - Transição (deslizar × desvanecer)
+    //
+    // "Esconder" = deslizar o painel para fora da borda do monitor principal. Com
+    // OUTRO monitor ao lado dessa borda, a área "fora da tela" é o monitor vizinho:
+    // o painel desliza para dentro dele e, pior, fica parado ali quando "escondido".
+    // Nesse caso o deslize é "recortado": a janela só ocupa a parte que está DENTRO
+    // do monitor principal (frame completo ∩ tela) e o conteúdo, em tamanho cheio,
+    // é deslocado dentro dela — visualmente é o mesmo painel entrando pela borda.
+
+    /// Frame de "escondido" rente à borda (sem a folga de 20 pt de `hiddenFrame`):
+    /// ponto de partida/chegada do deslize recortado.
+    static func flushHiddenFrame(for settings: AppSettings, screen: NSScreen) -> NSRect {
+        let v = visibleFrame(for: settings, screen: screen)
+        let s = screen.frame
+        switch settings.direction {
+        case .leftToRight: return v.offsetBy(dx: -(v.maxX - s.minX), dy: 0)
+        case .rightToLeft: return v.offsetBy(dx:  (s.maxX - v.minX), dy: 0)
+        case .topToBottom: return v.offsetBy(dx: 0, dy:  (s.maxY - v.minY))
+        case .bottomToTop: return v.offsetBy(dx: 0, dy: -(v.maxY - s.minY))
+        }
+    }
+
+    /// Janela (recortada) e deslocamento do conteúdo para um frame completo `full`
+    /// no passo atual. `window == nil` quando nada está dentro do monitor.
+    static func clip(full: NSRect, to screenFrame: NSRect) -> (window: NSRect, contentOrigin: NSPoint)? {
+        let v = full.intersection(screenFrame)
+        guard !v.isNull, v.width >= 1, v.height >= 1 else { return nil }
+        return (v, NSPoint(x: full.minX - v.minX, y: full.minY - v.minY))
+    }
+
+    nonisolated static func easeOut(_ t: Double) -> Double { 1 - pow(1 - t, 3) }
+    nonisolated static func easeIn(_ t: Double)  -> Double { pow(t, 2.2) }
+
+    /// `slide`: desliza a janela inteira para fora da borda (monitor sem vizinho).
+    /// `clippedSlide`: mesmo efeito visual, mas a janela é recortada na borda do
+    /// monitor principal para nunca aparecer no monitor vizinho.
+    enum Transition { case slide, clippedSlide }
+
+    /// Só para testes: força a transição em vez de decidir pelos monitores.
+    var transitionOverride: Transition?
+    /// Só para testes: multiplica a duração do deslize recortado (1 = normal).
+    var animationDurationScale: Double = 1
+
+    /// `true` se o frame "escondido" cai sobre algum outro monitor.
+    static func hiddenFrameCollides(_ hidden: NSRect, otherScreens: [NSRect]) -> Bool {
+        otherScreens.contains { $0.intersects(hidden) }
+    }
+
+    func transition(hidden: NSRect, screen: NSScreen) -> Transition {
+        if let forced = transitionOverride { return forced }
+        let others = NSScreen.screens.filter { $0 !== screen }.map(\.frame)
+        return SlideWindowController.hiddenFrameCollides(hidden, otherScreens: others) ? .clippedSlide : .slide
+    }
+
     // MARK: - Toggle Visibilidade
 
     @objc func toggleWindow() {
@@ -202,38 +277,141 @@ class SlideWindowController: NSWindowController, NSWindowDelegate {
         // A ContentView reativa a aba selecionada se ela foi descarregada por inatividade.
         NotificationCenter.default.post(name: .easyBarPanelDidShow, object: nil)
 
-        panel.setFrame(hidden, display: false)
-        panel.orderFrontRegardless()
+        switch transition(hidden: hidden, screen: screen) {
+        case .slide:
+            cancelClippedSlide()
+            panel.alphaValue = 1
+            panel.setFrame(hidden, display: false)
+            panel.orderFrontRegardless()
 
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration       = 0.35
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.animator().setFrame(visible, display: true)
-        } completionHandler: {
-            panel.makeKey()
-            panel.makeFirstResponderWebView()
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration       = 0.35
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                panel.animator().setFrame(visible, display: true)
+            } completionHandler: {
+                panel.makeKey()
+                panel.makeFirstResponderWebView()
+            }
+
+        case .clippedSlide:
+            panel.alphaValue = 1
+            let from = lastFullFrame
+                    ?? SlideWindowController.flushHiddenFrame(for: appSettings, screen: screen)
+            runClippedSlide(panel: panel, screen: screen, from: from, to: visible,
+                            duration: 0.35 * animationDurationScale, ease: SlideWindowController.easeOut) { [weak panel] in
+                panel?.makeKey()
+                panel?.makeFirstResponderWebView()
+            }
         }
     }
 
     func hideWindow() {
         guard let panel = window else { return }
 
-        let screen = SlideWindowController.mainScreen()
-        let hidden = SlideWindowController.hiddenFrame(for: appSettings, screen: screen)
+        let screen  = SlideWindowController.mainScreen()
+        let hidden  = SlideWindowController.hiddenFrame(for: appSettings, screen: screen)
+        let visible = SlideWindowController.visibleFrame(for: appSettings, screen: screen)
 
         isVisible = false
 
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration       = 0.3
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            panel.animator().setFrame(hidden, display: true)
+        switch transition(hidden: hidden, screen: screen) {
+        case .slide:
+            cancelClippedSlide()
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration       = 0.3
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                panel.animator().setFrame(hidden, display: true)
+            } completionHandler: { [weak self, weak panel] in
+                // Antes o painel só deslizava e continuava "aberto" fora da borda —
+                // com um monitor ao lado ele ficava visível ali. Agora some de verdade.
+                // (O usuário pode ter reaberto durante a animação: nesse caso não mexe.)
+                guard let self, let panel, !self.isVisible else { return }
+                panel.orderOut(nil)
+            }
+
+        case .clippedSlide:
+            let from = lastFullFrame ?? visible
+            let to   = SlideWindowController.flushHiddenFrame(for: appSettings, screen: screen)
+            runClippedSlide(panel: panel, screen: screen, from: from, to: to,
+                            duration: 0.3 * animationDurationScale, ease: SlideWindowController.easeIn) { [weak self, weak panel] in
+                guard let self, let panel, !self.isVisible else { return }
+                panel.orderOut(nil)
+                // Deixa a janela com o tamanho cheio para o próximo uso.
+                panel.setFrame(visible, display: false)
+            }
+        }
+    }
+
+    // MARK: - Deslize recortado (monitor vizinho na borda)
+
+    /// Anima o painel de `from` até `to` (frames COMPLETOS, sem recorte). A cada
+    /// quadro a janela vira (frame ∩ monitor principal) e o conteúdo — sempre com
+    /// o tamanho cheio — é deslocado dentro dela; quem recorta é a borda da janela.
+    /// Resultado: o mesmo "painel entrando pela borda", sem nunca tocar no outro monitor.
+    private func runClippedSlide(panel: NSWindow, screen: NSScreen, from: NSRect, to: NSRect,
+                                 duration: TimeInterval, ease: @escaping (Double) -> Double,
+                                 completion: @escaping () -> Void) {
+        guard let container = containerView, let hosting = hostingView else { completion(); return }
+
+        slideDriver?.cancel()
+        isSlideAnimating = true
+        container.autoresizesSubviews = false        // conteúdo mantém o tamanho cheio
+        hosting.frame.size = to.size
+        let screenFrame = screen.frame
+
+        let step: (Double) -> Void = { [weak self, weak panel] t in
+            guard let self, let panel else { return }
+            let e = ease(t)
+            let full = NSRect(x: from.minX + (to.minX - from.minX) * e,
+                              y: from.minY + (to.minY - from.minY) * e,
+                              width: to.width, height: to.height)
+            self.lastFullFrame = full
+            guard let clipped = SlideWindowController.clip(full: full, to: screenFrame) else {
+                if panel.isVisible { panel.orderOut(nil) }   // ainda/já totalmente fora
+                return
+            }
+            hosting.frame = NSRect(origin: clipped.contentOrigin, size: full.size)
+            panel.setFrame(clipped.window, display: true)
+            if !panel.isVisible { panel.orderFrontRegardless() }
+        }
+
+        slideDriver = SlideDriver(screen: screen, duration: duration, step: step) { [weak self] in
+            guard let self else { return }
+            self.slideDriver      = nil
+            self.isSlideAnimating = false
+            self.lastFullFrame    = nil
+            self.restoreRestingLayout(panelFrame: to)
+            completion()
+        }
+    }
+
+    /// Volta o contêiner ao estado de repouso (conteúdo acompanha o tamanho da janela).
+    private func restoreRestingLayout(panelFrame: NSRect) {
+        guard let container = containerView, let hosting = hostingView else { return }
+        // Só ajusta o frame da janela quando ela ficou mostrada no destino final.
+        if isVisible, let panel = window { panel.setFrame(panelFrame, display: true) }
+        hosting.frame = container.bounds
+        container.autoresizesSubviews = true
+    }
+
+    private func cancelClippedSlide() {
+        guard slideDriver != nil || lastFullFrame != nil else { return }
+        slideDriver?.cancel()
+        slideDriver       = nil
+        isSlideAnimating  = false
+        lastFullFrame     = nil
+        if let container = containerView, let hosting = hostingView {
+            hosting.frame = container.bounds
+            container.autoresizesSubviews = true
         }
     }
 
     // MARK: - Redimensionamento pelo usuário
 
     func windowDidResize(_ notification: Notification) {
-        guard let w = notification.object as? NSWindow, isVisible else { return }
+        // Durante o deslize recortado a largura/altura da janela muda a cada quadro —
+        // isso NÃO é o usuário redimensionando e não pode virar configuração salva.
+        guard let w = notification.object as? NSWindow, isVisible, !isSlideAnimating else { return }
         DispatchQueue.main.async {
             let screen = SlideWindowController.mainScreen()
             self.appSettings.widthPercent = max(0.01, min(1.0,
@@ -308,4 +486,42 @@ class SlideWindowController: NSWindowController, NSWindowDelegate {
             )
         }
     }
+}
+
+
+// MARK: - Motor de animação por quadro (deslize recortado)
+
+/// Chama `step(t)` com t∈[0,1] a cada atualização do monitor (CADisplayLink do
+/// próprio NSScreen — não depende de a janela estar visível) e `completion` ao fim.
+private final class SlideDriver: NSObject {
+    private var link: CADisplayLink?
+    /// O relógio só começa no PRIMEIRO quadro depois do passo inicial. Na primeira
+    /// abertura da sessão o primeiro `orderFront`/render do SwiftUI custa ~100 ms;
+    /// se o relógio já estivesse correndo, a animação "pularia" esse começo.
+    private var start: CFTimeInterval?
+    private let duration: TimeInterval
+    private let step: (Double) -> Void
+    private let completion: () -> Void
+
+    init(screen: NSScreen, duration: TimeInterval,
+         step: @escaping (Double) -> Void, completion: @escaping () -> Void) {
+        self.duration   = max(0.01, duration)
+        self.step       = step
+        self.completion = completion
+        super.init()
+        step(0)                                       // primeiro quadro já na posição inicial
+        let l = screen.displayLink(target: self, selector: #selector(tick(_:)))
+        l.add(to: .main, forMode: .common)
+        link = l
+    }
+
+    @objc private func tick(_ l: CADisplayLink) {
+        let now = CACurrentMediaTime()
+        if start == nil { start = now }
+        let t = min(1, (now - start!) / duration)
+        step(t)
+        if t >= 1 { cancel(); completion() }
+    }
+
+    func cancel() { link?.invalidate(); link = nil }
 }

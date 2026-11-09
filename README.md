@@ -2,7 +2,7 @@
 
 Alternativa gratuita ao [Slidepad](https://slidepad.app) para macOS. Painel lateral deslizante com abas de navegacao web, timer Pomodoro e bloco de notas.
 
-**Versao atual: 1.7.0**
+**Versao atual: 1.7.1**
 
 ## Funcionalidades
 
@@ -11,6 +11,7 @@ Alternativa gratuita ao [Slidepad](https://slidepad.app) para macOS. Painel late
 - Ativacao por atalho de teclado global (padrao: **Option+Q**)
 - Dimensoes e posicao configuraveis (porcentagem da tela)
 - Efeito frosted glass (material translucido nativo do macOS)
+- Funciona com varios monitores: o painel desliza pela borda do monitor principal sem aparecer no monitor vizinho
 
 ### Abas de navegacao
 - Abas com WKWebView integrado (navegacao web completa)
