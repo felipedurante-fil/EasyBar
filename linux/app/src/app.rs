@@ -527,11 +527,9 @@ impl App {
     fn apply_slide_frame(&self, full: &Rect, _clipped: bool, main: &Rect) {
         match geometry::clip(full, main) {
             None => {
-                // totalmente fora do monitor (início/fim do deslize)
-                if self.window.is_visible() {
-                    self.window.hide();
-                }
-                self.applied.set(None);
+                // Totalmente fora do monitor (início/fim do deslize): mantém a janela como
+                // está. NÃO esconder aqui — sem janela mapeada o relógio de quadros para e a
+                // animação morre; quem esconde é `finish_slide`, ao terminar de fechar.
             }
             Some((win, local)) => {
                 let (wi, hi) = (win.w.round().max(1.0), win.h.round().max(1.0));
