@@ -1,0 +1,23 @@
+[package]
+name = "easybar"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "EasyBar para Linux: painel lateral deslizante com abas web (GTK3 + WebKitGTK)."
+
+[[bin]]
+name = "easybar"
+path = "src/main.rs"
+
+[dependencies]
+easybar-core = { path = "../core" }
+gtk = { version = "0.18", features = ["v3_24"] }
+gdk = { version = "0.18", features = ["v3_24"] }
+glib = "0.18"
+gio = { version = "0.18", features = ["v2_66"] }
+gdkx11 = "0.18"
+webkit2gtk = { version = "2", features = ["v2_30"] }
+x11rb = "0.14"
+futures-channel = "0.3"
+cairo-rs = { version = "0.18", features = ["png"] }
+serde_json = "1"

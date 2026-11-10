@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=EasyBar
+GenericName=Painel deslizante com abas web
+Comment=Painel lateral deslizante com abas de sites (WhatsApp, Gemini, etc.)
+Exec=@EXEC@
+Icon=easybar
+Terminal=false
+Categories=Network;WebBrowser;
+StartupWMClass=easybar
+Actions=Toggle;
+
+[Desktop Action Toggle]
+Name=Mostrar/ocultar painel
+Exec=@EXEC@ --toggle

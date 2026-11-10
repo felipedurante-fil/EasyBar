@@ -65,6 +65,12 @@ Alternativa gratuita ao [Slidepad](https://slidepad.app) para macOS. Painel late
 
 O app abre na barra de menus (icone de sidebar). Nao aparece na Dock.
 
+## Versao para Linux
+
+Existe uma versao para **Linux (Cinnamon/X11, testada no Linux Mint)** na pasta [`linux/`](linux/),
+escrita em Rust + GTK3 + WebKitGTK. Ela importa o backup exportado pelo app do Mac. Veja
+[`linux/README.md`](linux/README.md) para instalar. (Em fase inicial: sem Notas e Pomodoro por enquanto.)
+
 ## Requisitos
 
 - macOS 26.4 ou superior (Apple Silicon)
